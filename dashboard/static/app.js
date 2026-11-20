@@ -1,12 +1,14 @@
 "use strict";
 
 const byId = (id) => document.getElementById(id);
-const state = { authors: [], videos: [], author: null, loaded: false };
+const state = { authors: [], profiles: [], videos: [], author: null, loaded: false };
 const collator = new Intl.Collator("zh-CN", { numeric: true });
 const player = byId("player");
 let pendingLoad = 0;
 let noticeTimer;
 let addingAuthor = false;
+let searchController = null;
+let selectedAccount = null;
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -98,6 +100,13 @@ function renderNav() {
   const activeAuthors = new Set(state.authors);
   const pastAuthors = Array.from(counts.keys()).filter(name => !activeAuthors.has(name)).sort(collator.compare);
   if (state.author !== null && !activeAuthors.has(state.author) && !counts.has(state.author)) state.author = null;
+  const profile = state.profiles.find(item => item?.name === state.author);
+  const profileLink = byId("saved-profile");
+  const href = accountLink(profile?.url);
+  profileLink.hidden = !href;
+  byId("link-profile").hidden = Boolean(href) || !activeAuthors.has(state.author);
+  if (href) profileLink.href = href;
+  else profileLink.removeAttribute("href");
   const all = byId("all-videos");
   all.classList.toggle("current", state.author === null);
   if (state.author === null) all.setAttribute("aria-current", "page");
@@ -208,6 +217,7 @@ async function loadDashboard() {
     if (!Array.isArray(data.authors) || !Array.isArray(data.videos)) throw new Error();
     if (version !== pendingLoad) return;
     state.authors = data.authors;
+    state.profiles = Array.isArray(data.profiles) ? data.profiles : [];
     state.videos = data.videos;
     state.loaded = true;
     render();
@@ -239,7 +249,7 @@ document.querySelectorAll("[data-close]").forEach(button => {
 });
 for (const dialog of document.querySelectorAll("dialog")) {
   dialog.addEventListener("click", event => {
-    if (event.target !== dialog) return;
+    if (event.target !== dialog || (dialog.id === "author-dialog" && addingAuthor)) return;
     const box = dialog.getBoundingClientRect();
     if (event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom) dialog.close();
   });
@@ -252,48 +262,148 @@ byId("player-dialog").addEventListener("close", () => {
   player.removeAttribute("poster");
   player.load();
 });
-byId("add-author").addEventListener("click", () => {
-  byId("author-form").reset();
+const authorDialog = byId("author-dialog");
+const authorQuery = byId("author-name");
+const accountOptions = byId("account-options");
+const accountList = byId("account-list");
+const searchButton = byId("search-author");
+const addButton = byId("submit-author");
+
+function resetAccountSearch() {
+  if (searchController) searchController.abort();
+  searchController = null;
+  selectedAccount = null;
+  accountList.replaceChildren();
+  accountOptions.hidden = true;
+  addButton.disabled = true;
+  searchButton.disabled = !authorQuery.value.trim() || addingAuthor;
+  byId("author-search-status").textContent = "";
   setError("author-error", "");
-  byId("author-dialog").showModal();
-  byId("author-name").focus();
+}
+
+function accountLink(value) {
+  if (typeof value !== "string" || !value) return "";
+  try {
+    const url = new URL(value);
+    const official = /(^|\.)(weixin\.qq\.com|weixin\.com)$/.test(url.hostname);
+    return official && url.protocol === "https:" && !url.username && !url.password && !url.port ? url.href : "";
+  } catch {
+    return "";
+  }
+}
+
+function showCandidate(candidate) {
+  if (!candidate || typeof candidate.name !== "string" || !candidate.name.trim() ||
+      typeof candidate.token !== "string" || !candidate.token) return;
+  const href = accountLink(candidate.url);
+  if (!href) return;
+  const card = element("div", "account-row");
+  const label = element("label", "account-choice");
+  const radio = element("input");
+  radio.type = "radio";
+  radio.name = "candidate";
+  radio.addEventListener("change", () => {
+    selectedAccount = candidate;
+    addButton.disabled = false;
+    setError("author-error", "");
+  });
+  const details = element("span", "account-details");
+  details.append(element("strong", "", candidate.name));
+  if (typeof candidate.description === "string" && candidate.description.trim()) {
+    details.append(element("span", "account-description", candidate.description));
+  }
+  label.append(radio, details);
+  const link = element("a", "account-link");
+  link.append(element("span", "", "视频号主页"), element("span", "account-url", href));
+  link.href = href;
+  link.title = href;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.setAttribute("aria-label", "查看「" + candidate.name + "」的视频号主页");
+  card.append(label, link);
+  accountList.append(card);
+}
+
+function openAuthorSearch(query) {
+  authorQuery.value = query;
+  resetAccountSearch();
+  authorDialog.showModal();
+  authorQuery.focus();
+}
+byId("add-author").addEventListener("click", () => openAuthorSearch(""));
+byId("link-profile").addEventListener("click", () => openAuthorSearch(state.author));
+authorDialog.addEventListener("close", resetAccountSearch);
+authorDialog.addEventListener("cancel", event => { if (addingAuthor) event.preventDefault(); });
+authorQuery.addEventListener("input", resetAccountSearch);
+
+byId("author-search-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const query = authorQuery.value.trim();
+  if (!query || addingAuthor || searchController) return;
+  resetAccountSearch();
+  const controller = new AbortController();
+  searchController = controller;
+  searchButton.disabled = true;
+  const status = byId("author-search-status");
+  status.textContent = "正在微信桌面搜索并核对主页…";
+  try {
+    const response = await fetch("/api/author-search?" + new URLSearchParams({ q: query }), {
+      cache: "no-store", signal: controller.signal
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "搜索暂不可用，请稍后重试。");
+    if (!Array.isArray(data.results)) throw new Error("未能读取搜索结果，请重新搜索。");
+    if (controller.signal.aborted) return;
+    for (const candidate of data.results) showCandidate(candidate);
+    const count = accountList.childElementCount;
+    accountOptions.hidden = count === 0;
+    status.textContent = count ? "找到 " + count + " 个账号，请核对后选择。" :
+      (data.results.length ? "这些结果没有可用的微信账号链接。" : "当前结果中没有匹配的视频号，试试完整名称。");
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    status.textContent = "";
+    setError("author-error", error instanceof TypeError ? "连接失败，请检查服务后重试。" : error.message);
+  } finally {
+    if (searchController === controller) {
+      searchController = null;
+      searchButton.disabled = false;
+    }
+  }
 });
 
-byId("author-form").addEventListener("submit", async event => {
-  event.preventDefault();
-  if (addingAuthor) return;
-  const name = byId("author-name").value.trim();
-  if (!name) {
-    setError("author-error", "请输入视频号名称。");
-    byId("author-name").focus();
-    return;
-  }
+addButton.addEventListener("click", async () => {
+  if (addingAuthor || !selectedAccount || searchController) return;
+  const account = selectedAccount;
   addingAuthor = true;
-  const dialog = byId("author-dialog");
-  const submit = byId("submit-author");
-  submit.disabled = true;
-  submit.textContent = "正在添加…";
+  addButton.disabled = searchButton.disabled = authorQuery.disabled = accountOptions.disabled = true;
+  addButton.textContent = "正在添加…";
+  const closeButtons = authorDialog.querySelectorAll("[data-close]");
+  closeButtons.forEach(button => { button.disabled = true; });
   setError("author-error", "");
   try {
     const response = await fetch("/api/authors", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name })
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: account.token })
     });
+    const data = await response.json();
     if (!response.ok) {
-      const data = await response.json().catch(() => ({}));
+      if ([400, 404, 409, 410].includes(response.status)) resetAccountSearch();
       throw new Error(typeof data.error === "string" ? data.error : "添加失败，请重试。");
     }
-    const existed = state.authors.includes(name);
-    dialog.close();
-    notice(existed ? "该视频号已在监控名单中" : "已添加「" + name + "」");
-    await loadDashboard();
+    authorDialog.close();
+    if (data.linked) notice("已为「" + account.name + "」关联视频号主页");
+    else notice(data.added === false ? "该视频号已在监控名单中" : "已添加「" + account.name + "」");
+    loadDashboard();
   } catch (error) {
     const message = error instanceof TypeError ? "连接失败，请检查服务后重试。" : error.message;
-    if (dialog.open) setError("author-error", message);
+    if (authorDialog.open) setError("author-error", message);
     else notice(message);
   } finally {
     addingAuthor = false;
-    submit.disabled = false;
-    submit.textContent = "加入监控名单";
+    authorQuery.disabled = accountOptions.disabled = false;
+    searchButton.disabled = !authorQuery.value.trim() || Boolean(searchController);
+    addButton.disabled = !selectedAccount;
+    addButton.textContent = "加入监控名单";
+    closeButtons.forEach(button => { button.disabled = false; });
   }
 });
 

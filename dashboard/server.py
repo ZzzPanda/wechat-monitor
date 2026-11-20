@@ -10,17 +10,25 @@ import re
 import sqlite3
 import stat
 import tempfile
-import unicodedata
 from contextlib import closing
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
+
+from account_search import AccountSelections, DesktopSearch, SearchUnavailable, profile_record, valid_text
 
 
 ROOT = Path('/Volumes/ssd1/wechat-monitor')
 KEY = r'[0-9a-f]{64}'
 LOCAL_HOST = re.compile(r'(?:127\.0\.0\.1|localhost|\[::1\])(?::[0-9]{1,5})?', re.I)
 RANGE = re.compile(r'bytes=([0-9]*)-([0-9]*)')
+
+
+PROFILE_PREFIX = '# wechat-profile '
+
+
+class IdentityConflict(Exception):
+    pass
 
 
 @dataclass
@@ -52,20 +60,43 @@ class Library:
         return list(dict.fromkeys(line.strip() for line in text.splitlines()
                                   if line.strip() and not line.lstrip().startswith('#')))
 
-    def add_author(self, value):
-        if not isinstance(value, str) or any(unicodedata.category(c) in ('Cc', 'Zl', 'Zp') for c in value):
-            raise ValueError('请输入单行视频号名称。')
-        name = value.strip()
-        if not name or len(name) > 64 or name.startswith('#'):
-            raise ValueError('请输入 1 至 64 个字符的视频号名称，首字符不能为 #。')
+    @staticmethod
+    def profiles(text):
+        records = {}
+        for line in text.splitlines():
+            if line.startswith(PROFILE_PREFIX):
+                try:
+                    account = profile_record(json.loads(line[len(PROFILE_PREFIX):]))
+                except (ValueError, RecursionError):
+                    continue
+                if account:
+                    records[account['name']] = account
+        return records
+
+    def add_author(self, account):
+        name = account['name']
         self.authors.parent.mkdir(parents=True, exist_ok=True)
         lock_path = self.authors.with_name(self.authors.name + '.lock')
         with lock_path.open('a+b') as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             text = self.author_text()
             authors = self.parse_authors(text)
-            if name in authors:
-                return authors, False
+            profiles = self.profiles(text)
+            previous = profiles.get(name)
+            if previous:
+                if previous.get('id') and account.get('id'):
+                    same = previous['id'] == account['id']
+                else:
+                    same = previous['url'] == account['url']
+                if not same:
+                    raise IdentityConflict('名单中已有另一条同名视频号记录，无法按名称区分，未添加。')
+                if name in authors:
+                    return authors, False, False
+            if any(item['name'] in authors and (item['url'] == account['url'] or
+                   (account.get('id') and item.get('id') == account['id'])) for item in profiles.values()):
+                return authors, False, False
+            added = name not in authors
+            saved = {k: account[k] for k in ('name', 'url', 'id') if k in account}
             mode = stat.S_IMODE(self.authors.stat().st_mode) if self.authors.exists() else 0o644
             with tempfile.TemporaryDirectory(dir=self.authors.parent) as directory:
                 pending = Path(directory) / 'authors'
@@ -74,12 +105,14 @@ class Library:
                         out.write(text)
                         if not text.endswith('\n'):
                             out.write('\n')
-                    out.write(name + '\n')
+                    if added:
+                        out.write(name + '\n')
+                    out.write(PROFILE_PREFIX + json.dumps(saved, ensure_ascii=False) + '\n')
                     os.fchmod(out.fileno(), mode)
                     out.flush()
                     os.fsync(out.fileno())
                 os.replace(pending, self.authors)
-            return [*authors, name], True
+            return ([*authors, name] if added else authors), added, not added
 
     def recordings(self, key=None):
         if not self.database.is_file():
@@ -114,7 +147,10 @@ class Library:
             videos.append(dict(id=key, author=row['author'], title=title[0] if title else '未命名作品',
                                published=row['published'], size=row['size'], duration=self.duration(key),
                                url='/media/' + key + '.mp4', poster='/posters/' + key + '.jpg' if poster.is_file() else None))
-        return dict(authors=self.parse_authors(self.author_text()), videos=videos)
+        text = self.author_text()
+        authors = self.parse_authors(text)
+        profiles = self.profiles(text)
+        return dict(authors=authors, profiles=[profiles[a] for a in authors if a in profiles], videos=videos)
 
 
 def local_file(root, relative):
@@ -210,14 +246,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if '\x00' in path:
             self.json_reply(400, {'error': '请求路径无效。'})
             return
-        if self.command == 'POST':
-            if path != '/api/authors':
-                self.json_reply(404, {'error': '接口不存在。'})
-                return
+        if self.command == 'POST' or path == '/api/author-search':
             origin = self.headers.get('Origin')
             if ((origin is not None and origin != 'http://' + hosts[0])
                     or self.headers.get('Sec-Fetch-Site', 'same-origin') not in ('same-origin', 'none')):
                 self.json_reply(403, {'error': '请从本机管理页提交。'})
+                return
+        if path == '/api/author-search':
+            if self.command != 'GET' or self.headers.get('Sec-Fetch-Dest', 'empty') != 'empty':
+                self.json_reply(400, {'error': '请在管理页中搜索。'})
+                return
+            try:
+                query = parse_qs(urlsplit(self.path).query, max_num_fields=1).get('q', [])
+            except ValueError:
+                query = []
+            if len(query) != 1 or not valid_text(query[0], 64):
+                self.json_reply(400, {'error': '请输入 1 至 64 个字符的视频号名称。'})
+                return
+            try:
+                results = self.server.selections.find(query[0].strip())
+            except SearchUnavailable as err:
+                self.json_reply(503, {'error': str(err)})
+                return
+            self.json_reply(200, dict(results=results))
+            return
+        if self.command == 'POST':
+            if path != '/api/authors':
+                self.json_reply(404, {'error': '接口不存在。'})
                 return
             if self.headers.get_content_type() != 'application/json':
                 self.json_reply(415, {'error': '预期 JSON 请求。'})
@@ -228,11 +283,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             try:
                 data = json.loads(self.rfile.read(int(length)).decode('utf-8'))
-                authors, added = lib.add_author(data.get('name') if isinstance(data, dict) else None)
             except (ValueError, RecursionError):
-                self.json_reply(400, {'error': '请输入有效的单行视频号名称（1 至 64 个字符，首字符不能为 #）。'})
+                self.json_reply(400, {'error': '请求格式无效。'})
                 return
-            self.json_reply(201 if added else 200, dict(authors=authors, added=added))
+            if not isinstance(data, dict) or set(data) != {'token'}:
+                self.json_reply(400, {'error': '请先搜索，再选择要添加的视频号。'})
+                return
+            try:
+                account = self.server.selections.resolve(data['token'])
+                authors, added, linked = lib.add_author(account)
+            except ValueError as err:
+                self.json_reply(400, {'error': str(err)})
+                return
+            except IdentityConflict as err:
+                self.json_reply(409, {'error': str(err)})
+                return
+            self.json_reply(201 if added else 200, dict(authors=authors, added=added, linked=linked))
         elif path == '/api/dashboard':
             self.json_reply(200, lib.dashboard())
         elif (match := re.fullmatch(r'/media/(' + KEY + r')\.mp4', path)):
@@ -259,9 +325,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 class DashboardServer(ThreadingHTTPServer):
-    def __init__(self, address, library):
+    def __init__(self, address, library, search=None):
         super().__init__(address, DashboardHandler)
         self.library = library
+        self.selections = AccountSelections(search or DesktopSearch(library.authors.parent))
 
 
 if __name__ == '__main__':

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from urllib.error import URLError
 from urllib.request import ProxyHandler, build_opener
 
@@ -59,7 +60,8 @@ def check_disk():
         raise RuntimeError('请挂载项目指定的 1 TB 外置盘 ssd1。')
     for path in [APP, RUNTIME, APP/'cache', APP/'lima', APP/'media', APP/'state', APP/'tmp',
                  APP/'scripts', APP/'tests', APP/'config', APP/'images', APP/'state/wechat-pilot',
-                 APP/'state/monitoring', APP/'state/posters', APP/'state/dashboard-app']:
+                 APP/'state/monitoring', APP/'state/monitoring/search-requests',
+                 APP/'state/monitoring/search-replies', APP/'state/posters', APP/'state/dashboard-app']:
         resolved = path.resolve()
         existing = next(p for p in (resolved, *resolved.parents) if p.exists())
         if not resolved.is_relative_to(VOLUME) or existing.stat().st_dev != VOLUME.stat().st_dev:
@@ -170,7 +172,8 @@ def install_authors():
 def install_dashboard_files(deploy):
     runtime = APP/'state/dashboard-app'
     source = SOURCE/'dashboard'
-    assets = [source/'server.py', *sorted(p for p in (source/'static').rglob('*') if p.is_file())]
+    assets = [source/'server.py', source/'account_search.py',
+              *sorted(p for p in (source/'static').rglob('*') if p.is_file())]
     revision = hashlib.sha256()
     for asset in assets:
         name = asset.relative_to(source)
@@ -181,6 +184,38 @@ def install_dashboard_files(deploy):
     copy_file(source/'Dockerfile', deploy/'dashboard/Dockerfile')
     copy_file(SOURCE/'deploy/posters.py', APP/'deploy/posters.py')
     return revision.hexdigest()
+
+
+def start_search_worker():
+    monitoring = APP/'state/monitoring'
+    requests, replies = monitoring/'search-requests', monitoring/'search-replies'
+    for folder in (requests, replies):
+        folder.mkdir(mode=0o700, exist_ok=True)
+    # macOS grants this user's interactive deployment access to the removable
+    # volume. Independent login agents require a separate disk access grant.
+    worker = [RUNTIME/'bin/wechat-python', '-B', APP/'scripts/author_search_worker.py', '--serve']
+    with (monitoring/'search-worker.log').open('ab') as log:
+        process = subprocess.Popen(worker, cwd='/', start_new_session=True, stdin=subprocess.DEVNULL,
+                                   stdout=log, stderr=log, env=dict(os.environ, TMPDIR=str(APP/'tmp')))
+    # An expired request exercises the actual shared queue without opening WeChat.
+    key = uuid.uuid4().hex + '.json'
+    request, reply = requests/key, replies/key
+    try:
+        with tempfile.TemporaryDirectory(dir=monitoring) as staging:
+            pending = Path(staging)/key
+            pending.write_text(json.dumps(dict(q='部署检查', expires=0)), encoding='utf-8')
+            os.replace(pending, request)
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            if reply.is_file() and '超时' in json.loads(reply.read_text()).get('error', ''):
+                return
+            if process.poll() not in (None, 0):
+                break
+            time.sleep(.2)
+        raise RuntimeError(f'视频号搜索进程启动检查失败，请查看 {monitoring}/search-worker.log。')
+    finally:
+        request.unlink(missing_ok=True)
+        reply.unlink(missing_ok=True)
 
 
 def start_vm():
@@ -301,6 +336,7 @@ def main():
             time.sleep(1)
         else:
             raise RuntimeError('管理页未就绪，请检查 dashboard 容器及本机 33023 端口。')
+        start_search_worker()
         print('视频号管理页：' + DASHBOARD)
         print('微信桌面已就绪：' + DESKTOP)
         print('保存命令：' + str(APP/'wechat-save') + ' save <微信分享链接>')

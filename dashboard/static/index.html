@@ -42,7 +42,11 @@
       <header class="page-header">
         <div>
           <h1 id="page-title">视频资料库</h1>
-          <p id="summary" class="summary" aria-live="polite">正在读取资料库…</p>
+          <div class="page-metadata">
+            <p id="summary" class="summary" aria-live="polite">正在读取资料库…</p>
+            <a id="saved-profile" class="saved-profile" target="_blank" rel="noopener noreferrer" hidden>视频号主页</a>
+            <button id="link-profile" class="link-profile" type="button" hidden>搜索并关联主页</button>
+          </div>
         </div>
         <button id="add-author" class="primary-button" type="button"><span class="plus-icon" aria-hidden="true"></span>添加视频号</button>
       </header>
@@ -81,16 +85,24 @@
       <h2 id="author-dialog-title">添加监控视频号</h2>
       <button class="close-button" type="button" aria-label="关闭" data-close="author-dialog"></button>
     </div>
-    <p class="dialog-intro">填写作者在微信视频号中使用的显示名称。</p>
-    <form id="author-form">
+    <p class="dialog-intro">用微信搜索账号，选择要监控的视频号。主页链接可在微信内打开。</p>
+    <form id="author-search-form">
       <label for="author-name" class="field-label">视频号名称</label>
-      <input class="text-field" id="author-name" name="name" required placeholder="例如：数字生命卡兹克" autocomplete="off">
-      <p class="inline-error" id="author-error" role="alert" hidden></p>
-      <div class="dialog-actions">
-        <button class="quiet-button" type="button" data-close="author-dialog">取消</button>
-        <button class="primary-button" id="submit-author" type="submit">加入监控名单</button>
+      <div class="author-search-row">
+        <input class="text-field" id="author-name" type="search" name="q" maxlength="64" required placeholder="例如：数字生命卡兹克" autocomplete="off" enterkeyhint="search">
+        <button class="quiet-button" id="search-author" type="submit">搜索</button>
       </div>
     </form>
+    <p id="author-search-status" class="author-search-status" role="status"></p>
+    <fieldset id="account-options" class="account-options" hidden>
+      <legend class="field-label">选择视频号</legend>
+      <div id="account-list" class="account-list"></div>
+    </fieldset>
+    <p class="inline-error" id="author-error" role="alert" hidden></p>
+    <div class="dialog-actions">
+      <button class="quiet-button" type="button" data-close="author-dialog">取消</button>
+      <button class="primary-button" id="submit-author" type="button" disabled>加入监控名单</button>
+    </div>
   </dialog>
 
   <dialog id="player-dialog" class="player-dialog" aria-labelledby="playing-title">

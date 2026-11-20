@@ -49,7 +49,10 @@ button, a, input, select { -webkit-tap-highlight-color: transparent; }
 .main { min-width: 0; width: 100%; max-width: 1800px; margin: 0 auto; padding: 44px clamp(22px,3.4vw,60px) 55px; }
 .page-header { display: flex; justify-content: space-between; align-items: center; gap: 18px; }
 h1 { margin: 0; font-size: clamp(28px,2.6vw,40px); line-height: 1.23; font-weight: 700; letter-spacing: -.055em; overflow-wrap: anywhere; }
-.summary { margin: 9px 0 0; font-size: 14px; color: var(--muted); }
+.page-metadata { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 12px; margin-top: 9px; }
+.summary { margin: 0; font-size: 14px; color: var(--muted); }
+.link-profile { padding: 0; background: transparent; border: 0; text-decoration: underline; }
+.saved-profile, .link-profile { color: var(--green); font-size: 13px; text-underline-offset: 2px; }
 .primary-button, .quiet-button, .icon-button { display: inline-flex; align-items: center; justify-content: center; gap: 9px; min-height: 40px; padding: 0 15px; border-radius: 8px; font-size: 14px; font-weight: 580; white-space: nowrap; transition: background .15s ease; }
 .primary-button { color: #fff; background: var(--green); border: 1px solid var(--green); }
 .primary-button:hover { background: #105e3e; }
@@ -102,7 +105,8 @@ h1 { margin: 0; font-size: clamp(28px,2.6vw,40px); line-height: 1.23; font-weigh
 .inline-error { color: #933427; background: #fdf0eb; padding: 10px 14px; font-size: 14px; border-radius: 7px; }
 dialog { color: var(--ink); border: none; padding: 0; border-radius: 15px; box-shadow: 0 14px 60px #14221a40; }
 dialog::backdrop { background: #16261dcc; opacity: .77; }
-.author-dialog { width: min(435px, calc(100vw - 26px)); padding: 24px; }
+.author-dialog { width: min(530px, calc(100vw - 26px)); max-height: 92dvh; padding: 24px; }
+.author-dialog button:disabled { cursor: default; }
 .dialog-titlebar, .player-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
 .dialog-titlebar h2, .player-head h2 { margin: 1px 0 0; font-size: 21px; line-height: 1.4; }
 .dialog-intro { margin: 9px 0 23px; }
@@ -112,6 +116,21 @@ dialog::backdrop { background: #16261dcc; opacity: .77; }
 .close-button::after { transform: rotate(-45deg); }
 .field-label { display: block; font-size: 14px; font-weight: 600; margin-bottom: 8px; }
 .text-field { display: block; width: 100%; height: 42px; border: 1px solid #bdc7bd; border-radius: 8px; padding: 0 12px; background: white; }
+.author-search-row { display: flex; gap: 8px; }
+.author-search-row .text-field { flex: 1; min-width: 0; }
+.author-search-status { margin: 16px 0 0; color: var(--muted); font-size: 13px; line-height: 1.6; }
+.author-search-status:empty { margin: 0; }
+.account-options { min-width: 0; padding: 0; margin: 16px 0 0; border: 0; }
+.account-options legend { padding: 0; }
+.account-list { display: grid; gap: 8px; max-height: min(32dvh, 260px); overflow: auto; }
+.account-row { min-width: 0; border: 1px solid var(--rule); border-radius: 8px; }
+.account-row:has(:checked) { background: var(--pale-green); border-color: var(--green); }
+.account-choice { display: flex; gap: 9px; align-items: flex-start; padding: 10px 12px 3px; cursor: pointer; }
+.account-choice input { flex: none; width: 16px; height: 16px; margin: 2px 0 0; accent-color: var(--green); }
+.account-details { display: grid; min-width: 0; gap: 3px; overflow-wrap: anywhere; font-size: 14px; line-height: 1.45; }
+.account-description { color: var(--muted); font-size: 13px; }
+.account-link { display: flex; align-items: baseline; gap: 8px; width: fit-content; max-width: calc(100% - 49px); margin: 0 12px 10px 37px; color: var(--green); font-size: 12px; line-height: 1.6; text-underline-offset: 2px; white-space: nowrap; }
+.account-url { overflow: hidden; color: var(--muted); text-overflow: ellipsis; }
 .dialog-actions { display: flex; justify-content: end; gap: 9px; margin-top: 23px; }
 .player-dialog { width: min(930px, calc(100vw - 30px)); max-height: 94dvh; background: #fff; }
 .player-head { padding: 17px 18px 13px; }
@@ -136,7 +155,8 @@ dialog::backdrop { background: #16261dcc; opacity: .77; }
   .storage { display: none; }
   .main { padding: 24px 16px 35px; }
   h1 { font-size: 27px; }
-  .summary { font-size: 12px; margin-top: 6px; }
+  .page-metadata { margin-top: 6px; }
+  .summary { font-size: 12px; }
   .page-header { gap: 11px; }
   .primary-button { padding: 0 11px; min-height: 37px; }
   .toolbar { margin: 21px 0 15px; padding-bottom: 14px; gap: 8px; }
