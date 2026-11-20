@@ -377,10 +377,12 @@ class Saving(unittest.TestCase):
         check(14, 13.2, last=13)
         check(14, 15.1)
         check(52, 54.243, last=51)
+        check(134, 132.316, last=133)
         check(224, 224.545, last=223)
         check(352, 354.167)
         for duration, elapsed, last, gap in [
                 (14, 33.625, 14, 0.375), (14, 12.9, 14, 0.375), (52, 58, 52, 0.375),
+                (134, 130.5, 133, 0.375),
                 (14, 14, 12, 0.375), (224, 224, 224, 1.2), (1520, 1528.1, 1520, 0.375)]:
             with self.subTest(duration=duration, elapsed=elapsed, last=last, gap=gap):
                 with self.assertRaises(entry['SaveError']) as caught:

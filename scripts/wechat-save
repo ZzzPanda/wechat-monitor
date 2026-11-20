@@ -255,10 +255,13 @@ def check_playback_timing(duration, elapsed, tail):
     # The UI clock excludes brief buffering after we click play. Accept that
     # lead-in when the observed end still belongs to this work.
     excess = min(8.0, 2.0 + 0.03 * duration)
-    if not math.isfinite(elapsed) or not duration - 1.0 <= elapsed <= duration + excess:
+    # The starting clock is displayed in whole seconds and the tail ends
+    # slightly before autoplay. Keep tighter bounds on very short works.
+    earliest = duration - min(2.5, max(1.0, duration * .02))
+    if not math.isfinite(elapsed) or not earliest <= elapsed <= duration + excess:
         raise SaveError('incomplete_playback',
                         f'界面时长 {duration:g} 秒，实录 {elapsed:.3f} 秒，'
-                        f'允许范围 {duration - 1.0:.2f} 至 {duration + excess:.2f} 秒。')
+                        f'允许范围 {earliest:.2f} 至 {duration + excess:.2f} 秒。')
 
 
 def capture_limit(duration):
