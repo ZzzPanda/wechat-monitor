@@ -4,11 +4,19 @@
 
 ## 一键部署
 
-在这台 M4 上挂载 `/Volumes/ssd1`，进入本仓库运行：
+挂载指定的 1 TB 外置盘 `/Volumes/ssd1`。这台 M4 已有源码，直接运行一条命令即可启动：
 
 ```sh
-./deploy.sh
+/Volumes/ssd1/wechat-monitor/source/deploy.sh
 ```
+
+首次用已登录的 GitHub CLI 安装，可以一条命令克隆源码到外盘并部署：
+
+```sh
+gh repo clone ZzzPanda/wechat-monitor /Volumes/ssd1/wechat-monitor/source && /Volumes/ssd1/wechat-monitor/source/deploy.sh
+```
+
+在已有的 Git 工作目录中也可以直接运行 `./deploy.sh`。
 
 看到「微信桌面已就绪」后，打开 [微信桌面](http://127.0.0.1:33021/)。第一次使用在微信桌面扫码。再次部署会识别现有容器及登录卷，并在它们已停止时启动。下载、录制或其他部署正在占用播放器时，稍后重试即可。
 
