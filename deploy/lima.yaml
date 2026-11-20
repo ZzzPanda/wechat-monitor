@@ -1,0 +1,47 @@
+vmType: vz
+arch: aarch64
+cpus: 4
+memory: 4GiB
+disk: 55GiB
+images:
+- location: @GUEST@
+  arch: aarch64
+mountType: virtiofs
+mounts:
+- location: @MEDIA@
+  writable: true
+- location: @STATE@
+  writable: true
+ssh:
+  loadDotSSHPubKeys: false
+containerd:
+  system: false
+  user: false
+provision:
+- mode: system
+  script: |
+    #!/bin/sh
+    set -eu
+    test -x /usr/bin/dockerd
+    install -d /etc/systemd/system/docker.socket.d
+    printf '[Socket]\nSocketUser={{.User}}\n' > /etc/systemd/system/docker.socket.d/wx.conf
+    systemctl daemon-reload
+    systemctl enable --now docker.socket docker.service
+    chown '{{.User}}' /var/run/docker.sock
+probes:
+- script: |
+    #!/bin/sh
+    set -eu
+    docker info >/dev/null
+  hint: Check Docker in the external VM.
+portForwards:
+- guestSocket: /var/run/docker.sock
+  hostSocket: '{{.Dir}}/sock/docker.sock'
+- guestIP: 127.0.0.1
+  guestPort: 33021
+  hostIP: 127.0.0.1
+  hostPort: 33021
+- guestIP: 127.0.0.1
+  guestPort: 33022
+  hostIP: 127.0.0.1
+  hostPort: 33022

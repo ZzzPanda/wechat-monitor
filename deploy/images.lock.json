@@ -1,0 +1,19 @@
+{
+  "player": {
+    "tag": "local/wechat-monitor-player:arm64-v1",
+    "platform": "linux/arm64",
+    "base": "lscr.io/linuxserver/weixin@sha256:30f07c689b723ddd5bf807c239ed9000933ae7a5a9658599278e203dc753f133",
+    "archive": "wechat-monitor-player-arm64-v1.tar",
+    "archive_sha256": "4eef821f9feb77c3f31e44e4c9947c2520d2b2201f1c8b13a6a342e4deb40ffb",
+    "archive_image_id": "sha256:43163f86b69e0abe1351cd7eb45aeedc157101e817d7ff6b4be566ce519c7417"
+  },
+  "previous_experiment": {
+    "name": "wx_channels_download",
+    "release": "v261106",
+    "source": "https://github.com/ltaoo/wx_channels_download",
+    "cached_release": "cache/channels-v261106.tar.gz",
+    "release_sha256": "73a083052016fc2f35cc4c74188f6045878f04e4553685ee8cc8a2649b4e3639",
+    "local_image": "local/wx-channels-server:v261106",
+    "local_image_id": "sha256:f8aa9760479bd08384663b8b01344193aee6dd9b1f42089c806d73af4e03259e"
+  }
+}

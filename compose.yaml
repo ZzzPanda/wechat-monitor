@@ -1,0 +1,31 @@
+name: wechat-monitor
+services:
+  weixin:
+    image: local/wechat-monitor-player:arm64-v1
+    build:
+      context: ./docker
+    pull_policy: never
+    platform: linux/arm64
+    container_name: wx-playback
+    hostname: wx-playback
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: Asia/Shanghai
+      LC_ALL: zh_CN.UTF-8
+      PIXELFLUX_WAYLAND: "false"
+      AUTO_GPU: "false"
+    shm_size: 1gb
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:33021:3000"
+      - "127.0.0.1:33022:3001"
+    volumes:
+      - weixin-profile:/config
+      - type: bind
+        source: ${WECHAT_MEDIA_DIR:-/Volumes/ssd1/wechat-monitor/media}
+        target: /config/Downloads
+        bind:
+          create_host_path: false
+volumes:
+  weixin-profile:

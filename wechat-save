@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+app=/Volumes/ssd1/wechat-monitor
+python="$app/runtime/bin/wechat-python"
+if [ ! -x "$python" ] || [ ! -f "$app/scripts/wechat-save" ]; then
+    echo '请先在源码目录运行 ./deploy.sh。' >&2
+    exit 1
+fi
+exec "$python" -B "$app/scripts/wechat-save" "$@"

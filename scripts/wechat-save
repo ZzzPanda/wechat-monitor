@@ -1,0 +1,556 @@
+#!/usr/bin/env python3
+"""Save a work from the signed-in WeChat Channels player, or verify an existing copy."""
+import argparse
+from contextlib import contextmanager, nullcontext
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import plistlib
+import re
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.dont_write_bytecode = True
+import wechat_preview as preview
+import wechat_recording as recordings
+
+from wechat_paths import DATA_ROOT as ROOT, VOLUME, DISK_UUID, DOCKER_HOST
+
+AUTHORS = ROOT / 'config' / 'authors.txt'
+STATE = preview.DATABASE.parent
+STAGING = ROOT / 'tmp' / 'staging'
+
+
+class SaveError(Exception):
+    def __init__(self, status, message, exit_code=1):
+        super().__init__(message)
+        self.status = status
+        self.exit_code = exit_code
+
+
+def verify_disk():
+    info = subprocess.run(['diskutil', 'info', '-plist', str(VOLUME)], capture_output=True, timeout=10)
+    if info.returncode or plistlib.loads(info.stdout).get('VolumeUUID') != DISK_UUID:
+        raise SaveError('disk_unavailable', '请挂载指定的 1 TB 外置盘 ssd1。')
+    for path in (ROOT, STATE, STAGING, recordings.MEDIA):
+        resolved = path.resolve()
+        existing = next(p for p in (resolved, *resolved.parents) if p.exists())
+        if not resolved.is_relative_to(VOLUME) or existing.stat().st_dev != VOLUME.stat().st_dev:
+            raise SaveError('disk_unavailable', '项目数据路径不在指定的外盘。')
+
+
+def ensure_directory(path):
+    """Create children of the already-mounted project. Never create the volume mountpoint."""
+    base = ROOT.resolve(strict=True)
+    relative = path.resolve().relative_to(base)
+    parent = base
+    for part in relative.parts:
+        parent = parent / part
+        parent.mkdir(mode=0o700, exist_ok=True)
+        if parent.stat().st_dev != base.stat().st_dev:
+            raise SaveError('disk_unavailable', '项目子目录离开了指定的外盘。')
+
+
+@contextmanager
+def exclusive_player():
+    with (STATE / 'save.lock').open('a+b') as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SaveError('busy', '另一个保存进程正在使用微信播放器，可稍后重试。', 75) from exc
+        yield
+
+
+def permitted_author(author):
+    authors = {line.strip() for line in AUTHORS.read_text().splitlines() if line.strip() and not line.lstrip().startswith('#')}
+    if author not in authors:
+        raise SaveError('outside_author_list', f'作者 {author} 不在 {AUTHORS} 中。')
+
+
+def work(db, url, *, fetch):
+    row = db.execute('SELECT w.* FROM works w JOIN links l USING(fingerprint) WHERE l.url=?', (url,)).fetchone()
+    if row is None and fetch:
+        chrome = next((p for p in (shutil.which('google-chrome'), shutil.which('chromium'),
+                       '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome') if p and os.access(p, os.X_OK)), None)
+        if not chrome:
+            raise SaveError('preview_unavailable', '缺少用于读取微信公开分享页的 Chrome/Chromium。')
+        try:
+            fields = preview.read_preview(chrome, url)
+        except (OSError, subprocess.TimeoutExpired):
+            time.sleep(1)
+            fields = preview.read_preview(chrome, url)
+        permitted_author(fields['author'])
+        result = preview.record(db, url, fields)
+        if result['status'] != 'ok':
+            raise SaveError('needs_review', result['reason'])
+        row = db.execute('SELECT w.* FROM works w JOIN links l USING(fingerprint) WHERE l.url=?', (url,)).fetchone()
+    if row is None:
+        raise SaveError('unknown_link', '这个微信分享链接尚未收录。')
+    if db.execute('SELECT 1 FROM review WHERE url=?', (url,)).fetchone():
+        raise SaveError('needs_review', '该分享链接的元数据或封面发生过变化，请复核。')
+    permitted_author(row['author'])
+    return dict(row)
+
+
+def write_journal(folder, data):
+    with tempfile.NamedTemporaryFile(mode='w', dir=folder, delete=False, prefix='.state-') as f:
+        json.dump(data, f, ensure_ascii=False, allow_nan=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(f.name, folder / 'job.json')
+    fd = os.open(folder, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def read_journal(folder, key):
+    path = folder / 'job.json'
+    if not path.exists():
+        return None
+    job = json.loads(path.read_text())
+    if job.get('version') != 1 or job.get('key') != key or job.get('phase') not in ('recording', 'recorded', 'captured', 'ready'):
+        raise SaveError('needs_review', f'录制状态不一致，请检查 {path}。')
+    return job
+
+
+def filename_part(value, limit):
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', value).strip(' .')
+    return (name or '作品').encode('utf-8')[:limit].decode('utf-8', 'ignore')
+
+
+def new_destination(item):
+    title = filename_part(item['caption'].splitlines()[0], 123)
+    author = filename_part(item['author'], 100)
+    return Path(author) / f"{item['published']} {title}（微信播放录制）-{item['fingerprint'][:12]}.mp4"
+
+
+def remove_partial_stages(folder):
+    for path in folder.iterdir():
+        if path.name.startswith(('wechat-player-', '.wechat-clip-')) and path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        elif path.name.startswith('.state-') and path.is_file():
+            path.unlink()
+
+
+def clean_stage(folder):
+    remove_partial_stages(folder)
+    for name in ('capture.mkv', 'raw.mp4', 'clip.mp4', 'job.json'):
+        (folder / name).unlink(missing_ok=True)
+    try:
+        folder.rmdir()
+    except OSError:
+        pass
+
+
+def progress(phase, **details):
+    print(json.dumps(dict(phase=phase, **details), ensure_ascii=False), file=sys.stderr, flush=True)
+
+
+def check_live_tools():
+    for name in ('docker', 'ffmpeg', 'ffprobe'):
+        if not shutil.which(name):
+            raise SaveError('runtime_unavailable', f'Mac 上找不到 {name}。')
+    docker = ['docker', '--host', DOCKER_HOST]
+    state = subprocess.run([*docker, 'inspect', '--format', '{{.State.Status}}', 'wx-playback'],
+                           capture_output=True, text=True, timeout=10)
+    if state.returncode:
+        raise SaveError('runtime_unavailable', '无法连接外盘上的 wx 虚拟机或 wx-playback 容器。')
+    if state.stdout.strip() in ('exited', 'created'):
+        subprocess.run([*docker, 'start', 'wx-playback'], check=True, capture_output=True, timeout=40)
+    elif state.stdout.strip() != 'running':
+        raise SaveError('runtime_unavailable', 'wx-playback 容器当前状态为 ' + state.stdout.strip())
+    checks = 'for tool in ffmpeg xdotool xprop xwininfo xsel pactl; do command -v "$tool" >/dev/null || { echo "$tool"; exit 1; }; done'
+    check = subprocess.run([*docker, 'exec', '-u', 'abc', 'wx-playback', 'sh', '-c', checks],
+                           capture_output=True, text=True, timeout=12)
+    if check.returncode:
+        raise SaveError('runtime_unavailable', '微信容器缺少运行工具或尚未就绪：' + check.stdout.strip())
+
+
+def close_confirmed_player(player):
+    """Close only the player whose visible title and account we previously identified."""
+    import numpy as np
+    from wechat_player import guest
+    if len(player.reference) != 2 or len(player.identity_regions) != 2:
+        raise RuntimeError('缺少已核实作品的标题和作者画面。')
+    _, image = player._image(player.identity_box)
+    ink = np.asarray(image.convert('L')) > 70
+    for region, reference in zip(player.identity_regions, player.reference):
+        current = ink[region]
+        if (current.shape != reference.shape or not reference.any()
+                or (current & reference).sum() < .9 * (current | reference).sum()):
+            raise RuntimeError('当前窗口的作品标题或作者已经变化。')
+    guest('sh', '-c', '[ "$(xdotool getactivewindow)" = "$1" ] && '
+          'xdotool key --clearmodifiers ctrl+w', 'sh', player.window)
+
+
+def revisit_confirmed_author(player):
+    from wechat_player import author_profile, lines
+    close_confirmed_player(player)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        _, image = player._image()
+        rows = lines(image)
+        if author_profile(rows, player.author, player.size):
+            return
+        time.sleep(0.12)
+    raise RuntimeError('本次未确认已返回作者主页。')
+
+
+@contextmanager
+def recover_failed_player(player):
+    try:
+        yield
+    except (SaveError, RuntimeError, ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as error:
+        # An unidentified or explicitly mismatched work is never a navigation target.
+        if player.reference is not None and getattr(error, 'status', None) != 'different_work':
+            try:
+                revisit_confirmed_author(player)
+                progress('returned_to_author_after_failure', author=player.author)
+            except Exception as recovery_error:
+                # Navigation is best effort. Preserve the actionable original item error for the queue.
+                progress('author_page_unavailable', detail=str(recovery_error))
+        raise
+
+
+def guard_playback_interrupt(player):
+    """Stop this verified work before frame-stream or recording cleanup can block."""
+    attempted = False
+
+    @contextmanager
+    def guard():
+        nonlocal attempted
+        try:
+            yield
+        except KeyboardInterrupt:
+            if not attempted:
+                attempted = True
+                try:
+                    close_confirmed_player(player)
+                    progress('interrupted_work_closed', author=player.author)
+                except Exception as error:
+                    progress('interrupted_player_unavailable', detail=str(error))
+            raise
+
+    return guard
+
+
+def check_playback_timing(duration, elapsed, tail):
+    # The UI displays whole seconds. The observer keeps a 250 ms guard in front
+    # of a transition detected between frames at most 650 ms apart.
+    transition_gap = tail['first_change_monotonic'] - tail['end_monotonic']
+    last_position = tail['last_position']
+    if (not math.isfinite(transition_gap) or not 0 <= transition_gap <= 0.95 or
+            not math.isfinite(last_position) or not duration - (1 if duration <= 60 else 2) <= last_position <= duration):
+        raise SaveError('incomplete_playback', '末段进度或最后确认画面到切集的间隔不足以验证正片。')
+    # Browser startup and clock rounding allow small excess. A stalled take must
+    # not inherit the recording process's much larger timeout/cleanup budget.
+    excess = min(5.0, 1.0 + 0.01 * duration)
+    if not math.isfinite(elapsed) or not duration - 1.0 <= elapsed <= duration + excess:
+        raise SaveError('incomplete_playback',
+                        f'界面时长 {duration:g} 秒，实录 {elapsed:.3f} 秒，'
+                        f'允许范围 {duration - 1.0:.2f} 至 {duration + excess:.2f} 秒。')
+
+
+def capture_limit(duration):
+    return min(14400, duration + max(45, duration * 0.15))
+
+
+def evidence_digest(evidence):
+    data = json.dumps(evidence, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+    return hashlib.sha256(data).hexdigest()
+
+
+def evidence_bounds(evidence):
+    tail = evidence['tail']
+    host_start = evidence['restart'] - evidence['origin']
+    host_end = tail['end_monotonic'] - evidence['origin']
+    if 'video_wall_origin' not in evidence:
+        # Old checkpoints used one startup transform. Its error was measured
+        # at over half a second on a long recording.
+        if evidence['duration'] > 60:
+            raise SaveError('timing_error', '长录制缺少逐帧校准的媒体时钟。')
+        return host_start, host_end
+    origin = evidence['video_wall_origin']
+    if origin is None or not all(key in tail for key in ('start_guest_wall', 'end_guest_wall', 'first_change_guest_wall')):
+        raise SaveError('timing_error', '缺少与 FFmpeg 首帧同一时基的起止证据。')
+    start = tail['start_guest_wall'] - origin
+    end = tail['end_guest_wall'] - origin
+    transition_gap = tail['first_change_guest_wall'] - tail['end_guest_wall']
+    if (not all(map(math.isfinite, (start, end, transition_gap))) or start < 0 or abs(start-host_start) > .15
+            or not .24 <= transition_gap <= .95
+            or abs(transition_gap - (tail['first_change_monotonic']-tail['end_monotonic'])) > .10
+            or abs((end-start)-(host_end-host_start)) > .12 + .002*(host_end-host_start)):
+        raise SaveError('timing_error', '实测 FFmpeg 媒体时间与播放器采样时间无法核对。')
+    return start, end
+
+
+def checkpoint_recording(folder, item, evidence, source, early):
+    job = read_journal(folder, item['fingerprint'])
+    if not job or job['phase'] != 'recording':
+        raise SaveError('needs_review', '本次录制的作业状态已变化。')
+    verify_disk()
+    # A pipe-written Matroska can advertise the recorder's planned duration
+    # even when it stopped early. Check actual data in both tracks through
+    # the observed cut before committing a reusable source.
+    spans = {}
+    with tempfile.TemporaryFile(dir=folder) as probe:
+        subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'packet=codec_type,pts_time,duration_time',
+                        '-of', 'csv=p=0', str(source)], stdout=probe, check=True,
+                       timeout=max(45, evidence['duration'] + 30))
+        probe.seek(0)
+        for line in probe:
+            fields = line.rstrip().split(b',')
+            if fields[0] in (b'video', b'audio'):
+                pts, length = float(fields[1]), float(fields[2])
+                if not math.isfinite(pts) or not math.isfinite(length) or length <= 0:
+                    raise SaveError('incomplete_capture', '原始媒体包含无效的数据包时间戳。')
+                first, last = spans.get(fields[0], (pts, pts))
+                spans[fields[0]] = min(first, pts), max(last, pts + length)
+    start, end = evidence_bounds(evidence)
+    if set(spans) != {b'audio', b'video'} or any(a > start or b < end for a, b in spans.values()):
+        raise SaveError('incomplete_capture', '实际音视频数据未覆盖本次确认的正片起止。')
+    original = folder / 'capture.mkv'
+    os.link(source, original)
+    with original.open('rb') as f:
+        os.fsync(f.fileno())
+        stat = os.fstat(f.fileno())
+    size, digest = recordings.file_signature(original)
+    evidence = dict(evidence, key=item['fingerprint'], author=item['author'], requested_url=job['url'],
+                    early=early, inode=stat.st_ino, mtime=stat.st_mtime_ns, size=size, sha256=digest)
+    job.update(phase='recorded', evidence=evidence, evidence_sha256=evidence_digest(evidence))
+    write_journal(folder, job)
+    progress('recorded_checkpoint', bytes=size, sha256=digest)
+
+
+def resume_recorded(db, folder, item, job):
+    from capture_wechat_player import LiveCapture
+    source, raw = folder / 'capture.mkv', folder / 'raw.mp4'
+    proof = job.get('evidence', {})
+    if (not isinstance(proof, dict) or evidence_digest(proof) != job.get('evidence_sha256')
+            or proof.get('key') != item['fingerprint'] or proof.get('author') != item['author']
+            or proof.get('requested_url') != job['url']
+            or recordings.work_key(db, proof.get('visible_url')) != item['fingerprint']):
+        raise SaveError('needs_review', '原始录制作业、作者、分享链接或时间证据不一致。')
+    if source.is_symlink() or not source.is_file():
+        raise SaveError('needs_review', '原始 MKV 已缺失或被替换。')
+    before = source.stat()
+    if ((before.st_ino, before.st_mtime_ns) != (proof['inode'], proof['mtime'])
+            or recordings.file_signature(source) != (proof['size'], proof['sha256'])):
+        raise SaveError('needs_review', '原始 MKV 身份或完整性校验失败。')
+    start, end = evidence_bounds(proof)
+    duration = proof['duration']
+    if (not math.isfinite(start) or start < 0 or not 1 <= duration <= 14100 or end > capture_limit(duration)
+            or type(proof['early']) is not bool or proof['window'] <= 0):
+        raise SaveError('needs_review', '原始录制的播放时钟或窗口证据无效。')
+    check_playback_timing(duration, end - start, proof['tail'])
+    capture = LiveCapture(crop=tuple(proof['crop']), duration=capture_limit(duration), output=raw)
+    progress('revalidating_recorded_capture', bytes=proof['size'])
+    with tempfile.TemporaryDirectory(dir=folder, prefix='wechat-player-') as stage:
+        ready = Path(stage) / 'verified.mp4'
+        capture.validate_recorded(source, ready, early=proof['early'])
+        after = source.stat()
+        if (not os.path.samestat(before, after) or before.st_size != after.st_size
+                or before.st_ctime_ns != after.st_ctime_ns or before.st_mtime_ns != after.st_mtime_ns):
+            raise SaveError('needs_review', '原始 MKV 在校验期间发生了变化。')
+        verify_disk()
+        os.replace(ready, raw)
+    return dict(start=start, end=end, duration=duration, last_position=proof['tail']['last_position'])
+
+
+def take_from_player(db, item, folder):
+    check_live_tools()
+    try:
+        from wechat_player import Player, PlayerError
+    except ImportError as exc:
+        raise SaveError('runtime_unavailable', f'当前 Python 缺少播放器依赖：{exc}') from exc
+    from capture_wechat_player import LiveCapture, assert_quiet_before_playback
+    player = Player(item['author'], item['caption'])
+    with recover_failed_player(player):
+        progress('locating_player', author=item['author'], title=item['caption'].splitlines()[0])
+        try:
+            prepared = player.prepare()
+            visible_url = player.copy_share_url()
+        except PlayerError as exc:
+            raise SaveError('needs_player', f'请确认容器微信已登录，前台为目标作品或可见该卡片的作者主页。详情：{exc}') from exc
+        if not preview.SHARE_URL.fullmatch(visible_url) or work(db, visible_url, fetch=True)['fingerprint'] != item['fingerprint']:
+            raise SaveError('different_work', '播放器分享的作品和任务链接不匹配。')
+        duration = float(prepared['duration'])
+        if not math.isfinite(duration) or not 1 <= duration <= 14100:
+            raise SaveError('player_unavailable', '微信播放器的作品时长不可用。')
+        maximum = capture_limit(duration)
+        # Room for the initial recording, remux and finished MP4 without filling the SSD.
+        if shutil.disk_usage(folder).free < max(256 * 1024**2, maximum * 3 * 1024**2):
+            raise SaveError('disk_full', '外盘剩余空间不足以保存本次录制和校验文件。')
+        raw = folder / 'raw.mp4'
+        assert_quiet_before_playback()
+        interrupt_guard = guard_playback_interrupt(player)
+        with (LiveCapture(window=prepared['window'], crop=tuple(prepared['crop']),
+                          duration=maximum, output=raw) as capture, interrupt_guard()):
+            zero = capture.start()
+            if capture.video_wall_origin is None:
+                raise SaveError('timing_error', '未能取得 FFmpeg X11 首帧时间。')
+            restart = player.restart()
+            start = restart - zero
+            if not math.isfinite(start) or start < 0:
+                raise SaveError('timing_error', '无法对齐微信播放起点与录制时钟。')
+            progress('recording', expected_playback_seconds=duration)
+            try:
+                tail = player.watch(interrupt_guard=interrupt_guard)
+            except PlayerError as exc:
+                raise SaveError('incomplete_playback', f'未能确认本次连续播放和片尾：{exc}') from exc
+            evidence = dict(visible_url=visible_url, window=prepared['window'], crop=list(prepared['crop']),
+                            origin=zero, video_wall_origin=capture.video_wall_origin,
+                            restart=restart, duration=duration, tail=tail)
+            if tail['first_change_monotonic'] > time.monotonic():
+                raise SaveError('timing_error', '切集观测时间晚于播放器实际返回时刻。')
+            check_playback_timing(duration, tail['end_monotonic']-restart, tail)
+            start, end = evidence_bounds(evidence)
+            check_playback_timing(duration, end-start, tail)
+            progress('confirmed_playback_bounds', media_start=start, media_end=end,
+                     host_start=restart-zero, host_end=tail['end_monotonic']-zero,
+                     video_wall_origin=capture.video_wall_origin)
+            capture.finish(on_recorded=lambda source, early:
+                           checkpoint_recording(folder, item, evidence, source, early))
+        return dict(start=start, end=end, duration=duration, last_position=tail['last_position']), player.return_to_author
+
+
+def save(db, url, item):
+    key = item['fingerprint']
+    current = recordings.lookup(db, url)
+    folder = STAGING / key
+    job = read_journal(folder, key) if folder.exists() else None
+    if current['status'] == 'verified':
+        if job:
+            clean_stage(folder)
+        return dict(current, status='already_saved')
+    recovering_repair = (current['status'] == 'changed' and job and job['phase'] == 'ready' and job.get('repairing'))
+    if current['status'] not in ('not_registered', 'missing') and not recovering_repair:
+        raise SaveError('needs_review', f"已登记文件状态为 {current['status']}，请检查 {current.get('path', '')}。")
+    ensure_directory(folder)
+    if job:
+        remove_partial_stages(folder)
+    destination = recordings.media_path(current.get('path') or new_destination(item))
+    raw, clip = folder / 'raw.mp4', folder / 'clip.mp4'
+    if destination.exists() and (not job or job['phase'] != 'ready'):
+        raise SaveError('needs_review', f'目标路径已有未核对的文件：{destination}')
+    return_to_author = None
+    if job is None or job['phase'] == 'recording':
+        if job is None and any(p.exists() for p in (raw, clip, folder / 'capture.mkv')):
+            raise SaveError('needs_review', f'暂存目录中有来源待核对的文件：{folder}')
+        job = dict(version=1, key=key, phase='recording', url=url, repairing=current['status'] == 'missing')
+        write_journal(folder, job)
+        raw.unlink(missing_ok=True)
+        clip.unlink(missing_ok=True)
+        (folder / 'capture.mkv').unlink(missing_ok=True)
+        bounds, return_to_author = take_from_player(db, item, folder)
+        job = read_journal(folder, key)
+    elif job['phase'] == 'recorded':
+        bounds = resume_recorded(db, folder, item, job)
+    if job['phase'] in ('recording', 'recorded'):
+        if job['phase'] == 'recorded':
+            with raw.open('rb') as f:
+                os.fsync(f.fileno())
+            job['raw_signature'] = recordings.file_signature(raw)
+        job.update(phase='captured', **bounds)
+        write_journal(folder, job)
+    if return_to_author:
+        try:
+            return_to_author()
+        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            progress('author_page_unavailable', detail=str(exc))
+    if job['phase'] == 'captured':
+        if 'raw_signature' in job and recordings.file_signature(raw) != tuple(job['raw_signature']):
+            raise SaveError('needs_review', '校验后的暂存 MP4 已被替换。')
+        progress('validating_clip', seconds=round(job['end'] - job['start'], 2))
+        from wechat_clip import clip_recording
+        clip_recording(raw, clip, start=job['start'], end=job['end'], title=item['caption'].splitlines()[0],
+                       author=item['author'], share_url=job['url'])
+        size, digest = recordings.file_signature(clip, probe=True)
+        job.update(phase='ready', size=size, digest=digest)
+        write_journal(folder, job)
+    verify_disk()
+    ensure_directory(destination.parent)
+    if not destination.exists():
+        if recordings.file_signature(clip) != (job['size'], job['digest']):
+            raise SaveError('needs_review', '待发布的录制文件发生变化。')
+        os.link(clip, destination)
+        parent_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    if recordings.file_signature(destination) != (job['size'], job['digest']):
+        raise SaveError('needs_review', '目标文件与录制校验值不同。')
+    progress('registering', file=str(destination))
+    result = recordings.register(db, url, str(destination), replace=bool(current['status'] == 'missing' or recovering_repair))
+    clean_stage(folder)
+    return dict(result, status='saved', player_seconds=job['duration'],
+                clip_seconds=round(job['end'] - job['start'], 3))
+
+
+def output(data):
+    print(json.dumps(data, ensure_ascii=False), flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=('save', 'status'))
+    parser.add_argument('urls', nargs='+', metavar='WECHAT_SHARE_URL')
+    args = parser.parse_args()
+    if any(not preview.SHARE_URL.fullmatch(url) for url in args.urls):
+        parser.error('需要完整的微信分享短链 https://weixin.qq.com/sph/...')
+    os.umask(0o077)
+    existing_path = os.environ.get('PATH', '').split(os.pathsep)
+    defaults = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin']
+    os.environ['PATH'] = os.pathsep.join(dict.fromkeys(path for path in existing_path + defaults if path))
+    verify_disk()
+    path = preview.DATABASE
+    if args.command == 'save':
+        ensure_directory(STATE)
+    elif not path.is_file():
+        raise SaveError('unknown_link', '本地索引尚未建立。')
+    result_code = 0
+    with exclusive_player() if args.command == 'save' else nullcontext():
+        uri = path.as_uri() + ('?mode=rwc' if args.command == 'save' else '?mode=ro')
+        with sqlite3.connect(uri, uri=True, timeout=15) as db:
+            db.row_factory = sqlite3.Row
+            if args.command == 'save':
+                preview.prepare(db)
+            for url in args.urls:
+                try:
+                    item = work(db, url, fetch=args.command == 'save')
+                    result = save(db, url, item) if args.command == 'save' else recordings.lookup(db, url)
+                    if 'path' in result:
+                        result['file'] = str(recordings.media_path(result['path']))
+                    output(dict(url=url, **result))
+                    if result['status'] not in ('already_saved', 'saved', 'verified'):
+                        result_code = max(result_code, 1)
+                except (ValueError, OSError, RuntimeError, sqlite3.Error, subprocess.SubprocessError, SaveError) as exc:
+                    output(dict(url=url, status=getattr(exc, 'status', 'failed'), error=str(exc)))
+                    result_code = max(result_code, getattr(exc, 'exit_code', 1))
+    return result_code
+
+
+if __name__ == '__main__':
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop)
+    try:
+        sys.exit(main())
+    except (ValueError, OSError, RuntimeError, sqlite3.Error, subprocess.SubprocessError, SaveError) as exc:
+        output(dict(status=getattr(exc, 'status', 'failed'), error=str(exc)))
+        sys.exit(getattr(exc, 'exit_code', 1))
+    except KeyboardInterrupt:
+        output(dict(status='interrupted', error='保存已中断。可用相同命令重试。'))
+        sys.exit(130)
