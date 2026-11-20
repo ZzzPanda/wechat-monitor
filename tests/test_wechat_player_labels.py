@@ -69,6 +69,32 @@ class PlayerLabels(unittest.TestCase):
         with self.assertRaises(PlayerError):
             p._get_crop(im)
 
+    def test_verified_square_work_uses_the_player_viewport(self):
+        p = Player('测试作者', '这是方形视频的标题')
+        p.window, p.size = 123, (1159, 961)
+        p.title, p.name = row(p.caption, 34, 838), row(p.author, 98, 889)
+        im = Image.new('RGB', p.size, 'black')
+        draw = ImageDraw.Draw(im)
+        draw.rectangle((0, 0, 1158, 52), fill='#eeeeee')
+        draw.rectangle((230, 120, 929, 819), fill='#95aabb')
+        p._inspect = Mock(return_value=im)
+        with patch('wechat_player.time.sleep'):
+            self.assertEqual(p._confirm_crop(im), (0, 54, 1158, 906))
+        # Even a tall window has no measured gutter in the fallback mode.
+        p.crop = (0, 54, 900, 1100)
+        self.assertFalse(p._has_pillarbox())
+        # A changed programme must still stop the operation during crop retries.
+        p._inspect.side_effect = PlayerError('The visible author and caption do not both match this work.')
+        with patch('wechat_player.time.sleep'), self.assertRaisesRegex(PlayerError, 'author and caption'):
+            p._confirm_crop(im)
+
+    def test_a_verified_landscape_keeps_its_tight_crop(self):
+        p = Player('测试作者', '这是横屏视频的标题')
+        p.title = row(p.caption, 34, 838)
+        im = Image.new('RGB', (1152, 960), 'black')
+        ImageDraw.Draw(im).rectangle((0, 105, 1151, 752), fill='#95aabb')
+        self.assertEqual(p._confirm_crop(im), (0, 105, 1152, 648))
+
     def test_portrait_track_crosses_the_picture_while_playing_and_paused(self):
         for paused, track_height in [(False, 5), (True, 5), (True, 0), (False, 26)]:
             with self.subTest(paused=paused, track_height=track_height):

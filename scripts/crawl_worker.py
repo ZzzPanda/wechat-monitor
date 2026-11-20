@@ -1,0 +1,223 @@
+"""Run the dashboard's history and incremental jobs on the signed-in desktop."""
+from contextlib import contextmanager
+from datetime import datetime, timezone, timedelta
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import runpy
+import sqlite3
+import subprocess
+import sys
+import time
+from urllib.error import HTTPError, URLError
+from urllib.request import ProxyHandler, Request, build_opener
+
+from wechat_paths import DATA_ROOT, check_drive
+
+MONITORING = DATA_ROOT / 'state/monitoring'
+PLAYER_LOCK = DATA_ROOT / 'state/wechat-pilot/save.lock'
+ENDPOINT = 'http://127.0.0.1:33023/api/crawl-worker'
+
+
+class ServiceError(Exception):
+    pass
+
+
+class Dashboard:
+    def __init__(self):
+        self.secret = (MONITORING / 'crawl-worker.key').read_text().strip()
+        self.opener = build_opener(ProxyHandler({}))
+
+    def __call__(self, op, **fields):
+        data = json.dumps(dict(op=op, **fields), ensure_ascii=False).encode()
+        request = Request(ENDPOINT, data=data, headers={'Content-Type': 'application/json',
+                                                       'X-Crawl-Worker': self.secret})
+        try:
+            with self.opener.open(request, timeout=15) as response:
+                return json.load(response)
+        except HTTPError as exc:
+            try:
+                message = json.load(exc).get('error')
+            except (ValueError, OSError):
+                message = ''
+            raise ServiceError(message or f'管理页响应 {exc.code}') from exc
+        except (URLError, OSError, ValueError) as exc:
+            raise ServiceError('采集管理页暂时无法连接。') from exc
+
+
+@contextmanager
+def try_lock(path):
+    with path.open('a+b') as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+        else:
+            yield True
+
+
+def run_job(api, job, saver, db, discover):
+    job_id, name, profile = job['id'], job['author'], job['profile_url']
+    mode = job['mode']
+    since = None
+    if mode == 'incremental':
+        prior = api('seen_before', profile_url=profile)
+        if not prior['known']:
+            mode = 'baseline'
+        elif prior.get('since') is not None:
+            beijing = timezone(timedelta(hours=8))
+            since = datetime.fromtimestamp(prior['since'], beijing).date().isoformat()
+    entry = dict(name=name, url=profile)
+    details = {}
+    errors = []
+    consecutive_errors = 0
+    processed = 0
+
+    def stopped():
+        return not api('active', id=job_id, author=name, profile_url=profile)['active']
+
+    def metadata(url):
+        if not saver['preview'].SHARE_URL.fullmatch(url):
+            raise ValueError('微信没有返回有效的作品分享链接。')
+        if url not in details:
+            item = saver['work'](db, url, fetch=True)
+            if item['author'] != name:
+                raise ValueError('分享页作者与监控账号不符。')
+            details[url] = item
+        return details[url]
+
+    item_errors = (ValueError, RuntimeError, OSError, sqlite3.Error,
+                   subprocess.SubprocessError, saver['SaveError'])
+
+    def known(url):
+        # A new share URL can point at the same work. Match its verified fingerprint.
+        try:
+            work = metadata(url)
+        except item_errors:
+            return False
+        # The preview gives a calendar date. Keep same-day posts eligible and
+        # resolve them by fingerprint, even when several were published together.
+        if since and work.get('published') and work['published'] < since:
+            return True
+        return api('known', profile_url=profile, key=work['fingerprint'])['known']
+
+    def handle(url):
+        nonlocal consecutive_errors, processed
+        if stopped():
+            return
+        link = url
+        try:
+            key = None
+            item = metadata(url)
+            key = item['fingerprint']
+            record = api('record', id=job_id, url=url, key=key)['item']
+            link = record['url']
+            if record['status'] in ('saved', 'skipped', 'baseline'):
+                return
+            if mode == 'baseline':
+                status = 'baseline'
+            else:
+                saved = saver['save'](db, url, item, return_to_profile=False)
+                if saved['status'] == 'saved':
+                    status = 'saved'
+                    saver['update_poster'](saved['work_key'])
+                elif saved['status'] == 'already_saved':
+                    status = 'skipped'
+                else:
+                    raise ValueError('作品尚未保存完成。')
+            api('item_done', id=job_id, url=link, status=status)
+            consecutive_errors = 0
+            processed += 1
+        except item_errors as exc:
+            message = str(exc)[:350] or '作品处理失败。'
+            if key is None:
+                placeholder = 'unresolved:' + hashlib.sha256(url.encode()).hexdigest()
+                link = api('record', id=job_id, url=url, key=placeholder)['item']['url']
+            api('item_done', id=job_id, url=link, status='failed', error=message)
+            errors.append(message)
+            consecutive_errors += 1
+            if consecutive_errors >= 3 or getattr(exc, 'status', '') in ('disk_full', 'disk_unavailable'):
+                raise RuntimeError(message) from exc
+        finally:
+            details.pop(url, None)
+
+    try:
+        outcome = discover(entry, mode=mode, known=known, on_work=handle, should_stop=stopped)
+        if stopped():
+            status, message = 'cancelled', '任务已停止或监控名单已变更。'
+        elif not outcome['complete'] or errors:
+            status, message = 'partial', ' '.join(filter(None, [outcome.get('reason'), *errors[-1:]]))
+        else:
+            status = 'done'
+            message = ('已记录首批作品，后续定时任务保存新增作品。' if mode == 'baseline'
+                       else outcome.get('reason', ''))
+    except ServiceError:
+        # A dashboard restart must leave the job recoverable on the next connection.
+        raise
+    except Exception as exc:
+        status = 'partial' if processed or errors else 'failed'
+        message = str(exc)[:400] or '采集未完成。'
+    api('finish', id=job_id, status=status, error=message[:500])
+
+
+def run_one(api):
+    # The single player stays on this author's grid between recordings.
+    with try_lock(MONITORING / 'crawl-run.lock') as worker, try_lock(PLAYER_LOCK) as player:
+        if not (worker and player):
+            return
+        job = api('claim')['job']
+        if not job:
+            return
+        try:
+            from wechat_discovery import crawl_profile
+            saver = runpy.run_path(str(Path(__file__).with_name('wechat-save')))
+            saver['verify_disk']()
+            with sqlite3.connect(saver['preview'].DATABASE, timeout=15) as db:
+                db.row_factory = sqlite3.Row
+                saver['preview'].prepare(db)
+                run_job(api, job, saver, db, crawl_profile)
+        except ServiceError:
+            raise
+        except Exception as exc:
+            api('finish', id=job['id'], status='failed', error=(str(exc) or '采集进程未能启动。')[:500])
+
+
+def serve():
+    script = Path(__file__).resolve()
+    with try_lock(MONITORING / 'crawl-service.lock') as owner:
+        if not owner:
+            return
+        version = script.stat().st_ino
+        child = None
+        recover = True
+        api = Dashboard()
+        while MONITORING.is_dir():
+            try:
+                if child and child.poll() is not None:
+                    recover = child.returncode != 0
+                    child = None
+                if not child and script.stat().st_ino != version:
+                    os.execv(sys.executable, [sys.executable, '-B', str(script), '--serve'])
+                if recover:
+                    with try_lock(MONITORING / 'crawl-run.lock') as idle:
+                        if idle:
+                            api('recover')
+                            recover = False
+                queued = api('tick')['queued']
+                if queued and child is None and not recover:
+                    child = subprocess.Popen([sys.executable, '-B', str(script), '--one'])
+            except (ServiceError, OSError) as exc:
+                print(str(exc), file=sys.stderr, flush=True)
+            time.sleep(4)
+
+
+if __name__ == '__main__':
+    check_drive()
+    if sys.argv[1:] == ['--serve']:
+        serve()
+    elif sys.argv[1:] == ['--one']:
+        run_one(Dashboard())
+    else:
+        sys.exit('请选择 --serve 或 --one。')

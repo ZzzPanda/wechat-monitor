@@ -175,6 +175,7 @@ class Player:
         self.crop = None
         self.controls = None
         self.title = None
+        self.name = None
         self.reference = None
         self.seek_origin = None
         self.start = None
@@ -332,7 +333,7 @@ class Player:
             top = row["y"] - y
             left = row["x"] - x
             width = row["width"]
-            if self.crop and self.crop[3] > self.crop[2]:
+            if self._has_pillarbox():
                 # On portrait works the footer overlays moving pixels. Compare only the
                 # portion printed in the observed black pillarbox of this window.
                 width = min(width, self.crop[0] - 3 - row["x"])
@@ -350,7 +351,7 @@ class Player:
         # left-hand label column, including both observed toolbar heights.
         top = max(55, ty - 245)
         trailer = (0, top, self.size[0], ty + 10 - top)
-        portrait = self.crop and self.crop[3] > self.crop[2]
+        portrait = self._has_pillarbox()
         deadline = time.monotonic() + 4
         move = False
         while True:
@@ -520,9 +521,21 @@ class Player:
                 return self._get_crop(im)
             except PlayerError:
                 if attempt == 5:
-                    raise
+                    # _inspect has verified the window, author and caption for
+                    # this exact frame. Keep the full playback area for square
+                    # or unusual ratios and for pictures with indistinct edges.
+                    if self.window is None or self.size != im.size or not self.name or not self.title:
+                        raise
+                    w, h = im.size
+                    top = 54  # The native Linux tab strip occupies rows 0..52.
+                    return (0, top, w // 2 * 2, (h - top) // 2 * 2)
                 time.sleep(0.18)
                 im = self._inspect()
+
+    def _has_pillarbox(self):
+        # A tall fallback viewport need not contain black side bars. Only the
+        # edge-detected portrait crop supplies a measured left/right gutter.
+        return self.crop is not None and self.crop[0] > 0 and self.crop[3] > self.crop[2]
 
     def inspect(self):
         im = self._inspect()
@@ -570,8 +583,12 @@ class Player:
         im = self._inspect()
         if not self._toolbar()["paused"]:
             raise PlayerError("Pause before copying the official work link.")
+        return self.copy_visible_share_url(im, self.name)
+
+    def copy_visible_share_url(self, im, author_row):
+        """Use the ordinary Share button next to the already verified author footer."""
         templ = np.asarray(Image.open(Path(__file__).with_name("wechat_share_button.png")).convert("L")) > 95
-        expected = (self.size[0] - 223, self.name["y"] - 29)
+        expected = (self.size[0] - 223, author_row["y"] - 29)
         plane = np.asarray(im.convert("L")) > 95
         matches = []
         for dx in range(-10, 11, 2):

@@ -48,6 +48,10 @@ button, a, input, select { -webkit-tap-highlight-color: transparent; }
 .disk-icon::after { content: ""; position: absolute; width: 3px; height: 2px; right: 3px; bottom: 2px; background: #607568; border-radius: 1px; }
 .main { min-width: 0; width: 100%; max-width: 1800px; margin: 0 auto; padding: 44px clamp(22px,3.4vw,60px) 55px; }
 .page-header { display: flex; justify-content: space-between; align-items: center; gap: 18px; }
+.page-header > div:first-child { min-width: 0; }
+.header-actions { display: flex; flex: none; flex-wrap: wrap; align-items: center; gap: 8px; }
+.header-actions > button { min-height: 40px; }
+.saved-note { margin: 8px 0 0; font-size: 14px; line-height: 1.55; color: var(--muted); overflow-wrap: anywhere; }
 h1 { margin: 0; font-size: clamp(28px,2.6vw,40px); line-height: 1.23; font-weight: 700; letter-spacing: -.055em; overflow-wrap: anywhere; }
 .page-metadata { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 12px; margin-top: 9px; }
 .summary { margin: 0; font-size: 14px; color: var(--muted); }
@@ -56,12 +60,36 @@ h1 { margin: 0; font-size: clamp(28px,2.6vw,40px); line-height: 1.23; font-weigh
 .primary-button, .quiet-button, .icon-button { display: inline-flex; align-items: center; justify-content: center; gap: 9px; min-height: 40px; padding: 0 15px; border-radius: 8px; font-size: 14px; font-weight: 580; white-space: nowrap; transition: background .15s ease; }
 .primary-button { color: #fff; background: var(--green); border: 1px solid var(--green); }
 .primary-button:hover { background: #105e3e; }
+.danger-button { background: #a6372c; border-color: #a6372c; }
+.danger-button:hover { background: #872a21; }
+.remove-link { color: #923c31; }
 .quiet-button, .icon-button { border: 1px solid var(--rule); background: #fff; }
 .quiet-button:hover, .icon-button:hover, .sort:hover { background-color: #eff3ed; }
 .plus-icon { width: 13px; height: 13px; position: relative; }
 .plus-icon::before, .plus-icon::after { content: ""; position: absolute; inset: 6px 0 auto; height: 1.6px; background: currentColor; border-radius: 2px; }
 .plus-icon::after { transform: rotate(90deg); }
 .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 0 0 17px; margin: 31px 0 21px; border-bottom: 1px solid var(--rule); }
+.crawl-panel { margin-top: 22px; border: 1px solid var(--rule); border-radius: 10px; background: #fff; }
+.crawl-panel > summary { padding: 12px 15px; cursor: pointer; color: var(--green); font-size: 14px; }
+.crawl-panel > summary strong { margin-left: 3px; color: var(--ink); }
+#crawl-summary { margin-left: 12px; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.crawl-content { padding: 3px 16px 13px; }
+.schedule-form, .schedule-start, .schedule-period, .schedule-switch { display: flex; gap: 6px; align-items: center; }
+.schedule-form { flex-wrap: wrap; gap: 8px 16px; font-size: 14px; }
+.schedule-switch input { accent-color: var(--green); width: 16px; height: 16px; margin: 0; }
+.schedule-period input, .schedule-start input { min-width: 0; max-width: 100%; height: 34px; border: 1px solid var(--rule); border-radius: 6px; padding: 0 6px; }
+.schedule-period input { width: 75px; }
+.schedule-start { flex-wrap: wrap; }
+.schedule-form button { min-height: 34px; }
+.crawl-hint { margin: 6px 0; color: var(--muted); font-size: 13px; }
+.crawl-panel h2 { margin: 16px 0 6px; }
+.crawl-jobs { list-style: none; padding: 0; margin: 0; max-height: 260px; overflow: auto; }
+.crawl-job { display: flex; flex-wrap: wrap; gap: 3px 12px; align-items: baseline; padding: 8px 0; border-top: 1px solid var(--rule); font-size: 13px; overflow-wrap: anywhere; }
+.crawl-job strong { font-size: 14px; }
+.crawl-job span { color: var(--muted); }
+.crawl-job .job-error, .crawl-job .job-info { flex-basis: 100%; }
+.crawl-job .job-error { color: #933427; }
+.cancel-crawl { color: #923c31; border: 0; background: transparent; padding: 2px 6px; min-height: 28px; font-size: 13px; text-decoration: underline; text-underline-offset: 2px; }
 .search, .sort { display: inline-flex; position: relative; align-items: center; height: 38px; min-width: 0; border: 1px solid var(--rule); background: #fff; border-radius: 8px; }
 .search { width: min(100%,340px); }
 .search input { width: 100%; min-width: 0; height: 100%; padding: 0 12px 0 37px; background: transparent; border: none; border-radius: inherit; font-size: 14px; }
@@ -110,6 +138,12 @@ dialog::backdrop { background: #16261dcc; opacity: .77; }
 .dialog-titlebar, .player-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
 .dialog-titlebar h2, .player-head h2 { margin: 1px 0 0; font-size: 21px; line-height: 1.4; }
 .dialog-intro { margin: 9px 0 23px; }
+#remove-description { overflow-wrap: anywhere; }
+.edit-fields { display: grid; gap: 19px; margin-top: 20px; }
+.edit-profile { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.edit-profile strong { overflow-wrap: anywhere; }
+.edit-profile button { flex: none; min-height: 32px; }
+.edit-url { display: block; width: fit-content; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .close-button { position: relative; flex: none; width: 32px; height: 32px; border: none; border-radius: 7px; background: #f1f4f0; cursor: pointer; }
 .close-button:hover { background: #e7ede5; }
 .close-button::before, .close-button::after { content: ""; position: absolute; width: 13px; top: 15px; left: 10px; border-top: 1.6px solid #46544a; transform: rotate(45deg); }
@@ -143,6 +177,7 @@ dialog::backdrop { background: #16261dcc; opacity: .77; }
 .nav-toggle { display: none; }
 @media (min-width: 1550px) { .gallery { grid-template-columns: repeat(auto-fill,minmax(285px,1fr)); } }
 @media (max-width: 1050px) { .workspace { grid-template-columns: 196px minmax(0,1fr); } .brand-bar { padding-left: 16px; } .brand { gap: 9px; font-size: 18px; } .main { padding: 35px 23px 45px; } .gallery { grid-template-columns: repeat(auto-fill,minmax(min(100%,213px),1fr)); gap: 17px 14px; } }
+@media (max-width: 1050px) { .page-header:has(.header-actions > :not(#add-author):not([hidden])) { flex-direction: column; align-items: flex-start; } .header-actions { max-width: 100%; } }
 @media (max-width: 720px) {
   .workspace { display: block; }
   .rail { position: static; display: block; height: auto; border: 0; border-bottom: 1px solid var(--rule); }

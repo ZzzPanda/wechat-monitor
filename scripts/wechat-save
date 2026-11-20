@@ -424,7 +424,7 @@ def take_from_player(db, item, folder):
         return dict(start=start, end=end, duration=duration, last_position=tail['last_position']), player.return_to_author
 
 
-def save(db, url, item):
+def save(db, url, item, *, return_to_profile=True):
     key = item['fingerprint']
     current = recordings.lookup(db, url)
     folder = STAGING / key
@@ -463,7 +463,7 @@ def save(db, url, item):
             job['raw_signature'] = recordings.file_signature(raw)
         job.update(phase='captured', **bounds)
         write_journal(folder, job)
-    if return_to_author:
+    if return_to_author and return_to_profile:
         try:
             return_to_author()
         except (RuntimeError, OSError, subprocess.SubprocessError) as exc:

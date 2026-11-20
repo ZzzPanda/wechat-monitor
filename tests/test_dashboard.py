@@ -9,7 +9,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 root = Path(__file__).resolve().parents[1]
 module = root/'dashboard' if (root/'dashboard/server.py').is_file() else root/'state/dashboard-app'
@@ -71,6 +71,17 @@ class DashboardTests(unittest.TestCase):
         status, _, body = self.request('GET', '/api/dashboard')
         self.assertEqual(status, 200)
         return [(p['name'], p['url']) for p in json.loads(body)['profiles']]
+
+    def entries(self):
+        status, _, body = self.request('GET', '/api/authors')
+        self.assertEqual(status, 200, body)
+        return json.loads(body)['entries']
+
+    def change(self, method, name, data, headers=None):
+        path = '/api/authors/' + quote(name, safe='')
+        status, _, body = self.request(method, path, json.dumps(data),
+                                       {'Content-Type': 'application/json', **(headers or {})})
+        return status, json.loads(body)
 
     def test_plain_text_and_unselected_links_cannot_add_an_author(self):
         candidate = profile('新作者', 'fixtureAccount1')
@@ -176,7 +187,8 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(self.lib.parse_authors(self.lib.author_text()), ['旧作者'])
 
     def test_authors_are_persistent_and_deduplicated(self):
-        self.assertEqual(json.loads(self.request('GET', '/api/dashboard')[2]), dict(authors=[], profiles=[], videos=[]))
+        self.assertEqual(json.loads(self.request('GET', '/api/dashboard')[2]),
+                         dict(authors=[], profiles=[], entries=[], videos=[]))
         self.lib.authors.write_text('# 备注\n旧作者', encoding='utf-8')
         profiles = [profile('新作者', 'fixtureNewAccount'), profile('A', 'fixtureAccountA'),
                     profile('B', 'fixtureAccountB')]
@@ -193,6 +205,91 @@ class DashboardTests(unittest.TestCase):
         # A fresh Library reads verified links from disk and still accepts plain names in the legacy file.
         reopened = Library(self.lib.authors, self.lib.database, self.lib.media, self.lib.posters, self.lib.static)
         self.assertEqual(reopened.dashboard()['profiles'], self.lib.dashboard()['profiles'])
+
+    def test_legacy_author_note_delete_and_readd(self):
+        name = '城市/影像 ?#%2F'
+        self.lib.authors.write_text('# 手工说明\n' + name + '\n' + name, encoding='utf-8')
+        item, = self.entries()
+        self.assertEqual((item['name'], item['url'], item['note']), (name, None, ''))
+        self.assertIsInstance(item['version'], str)
+        self.assertTrue(item['version'])
+        status, body = self.change('PATCH', name, {'version': item['version'], 'note': '素材 #1'})
+        self.assertEqual(status, 200, body)
+        updated = body['entry']
+        self.assertNotEqual(updated['version'], item['version'])
+        self.assertEqual((updated['name'], updated['url'], updated['note']), (name, None, '素材 #1'))
+        self.assertEqual(self.entries(), [updated])
+        self.assertEqual(json.loads(self.request('GET', '/api/dashboard')[2])['entries'], [updated])
+        self.assertEqual(self.lib.parse_authors(self.lib.author_text()), [name])
+        self.assertEqual(self.change('DELETE', name, {'version': item['version']})[0], 409)
+        status, body = self.change('PATCH', name, {'version': updated['version'], 'note': ''})
+        self.assertEqual(status, 200, body)
+        cleared = body['entry']
+        self.assertEqual(cleared['note'], '')
+        self.assertEqual(self.change('DELETE', name, {'version': cleared['version']}), (200, {'removed': True}))
+        self.assertEqual(self.change('DELETE', name, {'version': cleared['version']})[0], 404)
+        self.assertEqual(self.change('PATCH', name, {'version': cleared['version'], 'note': '旧页'})[0], 404)
+        self.assertEqual(self.entries(), [])
+        self.assertEqual(self.lib.author_text().splitlines(), ['# 手工说明'])
+        reopened = Library(self.lib.authors, self.lib.database, self.lib.media, self.lib.posters, self.lib.static)
+        self.assertEqual(reopened.dashboard()['entries'], [])
+        self.matches[name] = [profile(name, 'readdedAuthor')]
+        candidate, = self.search(name)
+        self.assertEqual(self.submit({'token': candidate['token']})[0], 201)
+        readded, = self.entries()
+        self.assertEqual((readded['name'], readded['url'], readded['note']), (name, candidate['url'], ''))
+
+    def test_verified_replacement_corrects_same_name_and_rejects_conflicts(self):
+        self.lib.authors.write_text('旧作者\n', encoding='utf-8')
+        self.matches['校正'] = [profile('新作者', 'firstID'), profile('新作者', 'secondID'),
+                               profile('已监控', 'otherID'), profile('另一个名称', 'otherID')]
+        first, second, other = self.search('校正')  # the last candidate shares the third identity
+        self.assertEqual(self.submit({'token': other['token']})[0], 201)
+        old = next(e for e in self.entries() if e['name'] == '旧作者')
+        status, body = self.change('PATCH', '旧作者', dict(version=old['version'], token=first['token'], note='分类'))
+        self.assertEqual(status, 200, body)
+        new = body['entry']
+        self.assertEqual((new['name'], new['url'], new['note']), ('新作者', first['url'], '分类'))
+        status, body = self.change('PATCH', new['name'], dict(version=new['version'], token=second['token']))
+        self.assertEqual(status, 200, body)
+        corrected = body['entry']
+        self.assertEqual((corrected['url'], corrected['note']), (second['url'], '分类'))
+        self.assertEqual(self.saved_profiles(), [('新作者', second['url']), ('已监控', other['url'])])
+        self.matches['冲突'] = [profile('另一显示名', 'otherID'), profile('已监控', 'newID')]
+        before = self.lib.author_text()
+        for candidate in [other, *self.search('冲突')]:
+            status, _ = self.change('PATCH', corrected['name'],
+                                    dict(version=corrected['version'], token=candidate['token'], note='错误的修改'))
+            self.assertEqual(status, 409)
+            self.assertEqual(self.lib.author_text(), before)
+
+    def test_mutations_reject_unverified_or_cross_site_inputs(self):
+        self.lib.authors.write_text('作者', encoding='utf-8')
+        item, = self.entries()
+        version = {'version': item['version']}
+        for fields in (version, {}, {'note': '缺少版本'}, {**version, 'token': '伪造'},
+                       {**version, 'note': None}, {**version, 'note': '换\n行'},
+                       {**version, 'note': '长' * 201}, {**version, 'url': 'https://example.com/'}):
+            with self.subTest(fields=fields):
+                self.assertEqual(self.change('PATCH', item['name'], fields)[0], 400)
+        for data in ({}, {**version, 'name': '其他'}):
+            self.assertEqual(self.change('DELETE', item['name'], data)[0], 400)
+        for method, data in [('PATCH', {**version, 'note': '备注'}), ('DELETE', version)]:
+            for headers, expected in [({'Origin':'https://example.com'}, 403), ({'Host':'bad.example'}, 403),
+                                      ({'Sec-Fetch-Site':'cross-site'}, 403), ({'Content-Type':'text/plain'}, 415)]:
+                with self.subTest(method=method, headers=headers):
+                    self.assertEqual(self.change(method, item['name'], data, headers)[0], expected)
+        self.assertEqual(self.entries(), [item])
+
+    def test_overlapping_edits_do_not_overwrite_each_other(self):
+        self.lib.authors.write_text('作者\n第二个', encoding='utf-8')
+        first, second = self.entries()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            answers = list(pool.map(lambda note: self.change('PATCH', first['name'],
+                                    {'version': first['version'], 'note': note}), ['备注甲', '备注乙']))
+        self.assertCountEqual([status for status, _ in answers], [200, 409])
+        winner, = [data['entry'] for status, data in answers if status == 200]
+        self.assertEqual(self.entries(), [winner, second])
 
     def test_write_requires_local_page_and_json(self):
         self.matches['作者'] = [profile('作者', 'fixtureAccount')]
@@ -233,6 +330,12 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(status, 200)
         row = json.loads(body)['videos'][0]
         self.assertEqual((row['id'], row['author'], row['title'], row['duration']), (key,'历史作者','标题',3.5))
+        self.lib.authors.write_text('历史作者\n', encoding='utf-8')
+        active, = self.entries()
+        self.assertEqual(self.change('DELETE', active['name'], {'version': active['version']})[0], 200)
+        history = json.loads(self.request('GET', '/api/dashboard')[2])
+        self.assertEqual(history['entries'], [])
+        self.assertEqual(history['videos'], json.loads(body)['videos'])
         self.assertEqual(self.request('GET', row['poster'])[2], b'poster')
         url = row['url']
         status, headers, data = self.request('GET', url, headers={'Range':'bytes=2-4'})

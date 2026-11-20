@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import plistlib
 import shlex
+import secrets
 import shutil
 import subprocess
 import sys
@@ -172,7 +173,7 @@ def install_authors():
 def install_dashboard_files(deploy):
     runtime = APP/'state/dashboard-app'
     source = SOURCE/'dashboard'
-    assets = [source/'server.py', source/'account_search.py',
+    assets = [source/'server.py', source/'account_search.py', source/'crawl_queue.py',
               *sorted(p for p in (source/'static').rglob('*') if p.is_file())]
     revision = hashlib.sha256()
     for asset in assets:
@@ -216,6 +217,32 @@ def start_search_worker():
     finally:
         request.unlink(missing_ok=True)
         reply.unlink(missing_ok=True)
+
+
+def start_crawl_worker():
+    monitoring = APP/'state/monitoring'
+    key = monitoring/'crawl-worker.key'
+    if not key.exists():
+        with tempfile.TemporaryDirectory(dir=monitoring) as stage:
+            pending = Path(stage)/'key'
+            pending.write_text(secrets.token_hex(32))
+            pending.chmod(0o600)
+            os.replace(pending, key)
+    command = [RUNTIME/'bin/wechat-python', '-B', APP/'scripts/crawl_worker.py', '--serve']
+    with (monitoring/'crawl-worker.log').open('ab') as log:
+        child = subprocess.Popen(command, cwd='/', start_new_session=True, stdin=subprocess.DEVNULL,
+                                 stdout=log, stderr=log, env=dict(os.environ, TMPDIR=str(APP/'tmp')))
+    opener = build_opener(ProxyHandler({}))
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and child.poll() in (None, 0):
+        try:
+            with opener.open(DASHBOARD+'api/crawls', timeout=3) as response:
+                if json.load(response).get('worker_online'):
+                    return
+        except (ValueError, URLError, OSError):
+            pass
+        time.sleep(.4)
+    raise RuntimeError(f'定时采集进程未就绪，请查看 {monitoring}/crawl-worker.log。')
 
 
 def start_vm():
@@ -337,6 +364,7 @@ def main():
         else:
             raise RuntimeError('管理页未就绪，请检查 dashboard 容器及本机 33023 端口。')
         start_search_worker()
+        start_crawl_worker()
         print('视频号管理页：' + DASHBOARD)
         print('微信桌面已就绪：' + DESKTOP)
         print('保存命令：' + str(APP/'wechat-save') + ' save <微信分享链接>')
