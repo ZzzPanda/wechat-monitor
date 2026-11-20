@@ -51,8 +51,8 @@ button, a, input, select { -webkit-tap-highlight-color: transparent; }
 h1 { margin: 0; font-size: clamp(28px,2.6vw,40px); line-height: 1.23; font-weight: 700; letter-spacing: -.055em; overflow-wrap: anywhere; }
 .page-metadata { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 12px; margin-top: 9px; }
 .summary { margin: 0; font-size: 14px; color: var(--muted); }
-.link-profile { padding: 0; background: transparent; border: 0; text-decoration: underline; }
-.saved-profile, .link-profile { color: var(--green); font-size: 13px; text-underline-offset: 2px; }
+.link-profile, .fresh-search { padding: 0; background: transparent; border: 0; text-decoration: underline; }
+.saved-profile, .link-profile, .fresh-search { color: var(--green); font-size: 13px; text-underline-offset: 2px; }
 .primary-button, .quiet-button, .icon-button { display: inline-flex; align-items: center; justify-content: center; gap: 9px; min-height: 40px; padding: 0 15px; border-radius: 8px; font-size: 14px; font-weight: 580; white-space: nowrap; transition: background .15s ease; }
 .primary-button { color: #fff; background: var(--green); border: 1px solid var(--green); }
 .primary-button:hover { background: #105e3e; }
@@ -120,6 +120,7 @@ dialog::backdrop { background: #16261dcc; opacity: .77; }
 .author-search-row .text-field { flex: 1; min-width: 0; }
 .author-search-status { margin: 16px 0 0; color: var(--muted); font-size: 13px; line-height: 1.6; }
 .author-search-status:empty { margin: 0; }
+.fresh-search { min-height: 28px; }
 .account-options { min-width: 0; padding: 0; margin: 16px 0 0; border: 0; }
 .account-options legend { padding: 0; }
 .account-list { display: grid; gap: 8px; max-height: min(32dvh, 260px); overflow: auto; }

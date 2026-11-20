@@ -56,10 +56,16 @@ class DashboardTests(unittest.TestCase):
         return self.request('POST', '/api/authors', json.dumps(data),
                             {'Content-Type': 'application/json', **(headers or {})})
 
-    def search(self, query):
-        status, _, body = self.request('GET', '/api/author-search?' + urlencode({'q': query}))
+    def search_response(self, query, *, fresh=False):
+        params = {'q': query}
+        if fresh:
+            params['fresh'] = '1'
+        status, _, body = self.request('GET', '/api/author-search?' + urlencode(params))
         self.assertEqual(status, 200, body)
-        return json.loads(body)['results']
+        return json.loads(body)
+
+    def search(self, query):
+        return self.search_response(query)['results']
 
     def saved_profiles(self):
         status, _, body = self.request('GET', '/api/dashboard')
@@ -100,6 +106,49 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(self.lib.author_text(), '')
             fresh, = self.search('作者')
             self.assertEqual(self.submit({'token': fresh['token']})[0], 201)
+            self.assertEqual(self.queries, ['作者', '作者'])
+
+    def test_cache_matches_only_the_same_keyword_and_issues_new_tokens(self):
+        candidate = profile('目标账号', 'fixtureTarget')
+        self.matches['目标'] = [candidate]
+        self.matches['目标账号'] = [profile('另一个账号', 'fixtureOther')]
+        original = self.search_response('目标')
+        cached = self.search_response('目标')
+        self.assertFalse(original['cached'])
+        self.assertTrue(cached['cached'])
+        first, = original['results']
+        again, = cached['results']
+        self.assertEqual(again['url'], first['url'])
+        self.assertNotEqual(again['token'], first['token'])
+        self.assertEqual(self.submit({'token': again['url']})[0], 400)
+        self.assertEqual(self.submit({'token': again['token']})[0], 201)
+        other = self.search_response('目标账号')
+        self.assertFalse(other['cached'])
+        self.assertEqual(other['results'][0]['name'], '另一个账号')
+        self.assertEqual(self.queries, ['目标', '目标账号'])
+
+    def test_fresh_search_replaces_cached_matches_and_clears_them_on_empty(self):
+        self.matches['目标'] = [profile('旧结果', 'fixtureOld')]
+        self.search('目标')
+        self.matches['目标'] = [profile('新结果', 'fixtureNew')]
+        updated = self.search_response('目标', fresh=True)
+        self.assertFalse(updated['cached'])
+        self.assertEqual(updated['results'][0]['name'], '新结果')
+        cached = self.search_response('目标')
+        self.assertTrue(cached['cached'])
+        self.assertEqual(cached['results'][0]['name'], '新结果')
+        self.matches['目标'] = []
+        self.assertEqual(self.search_response('目标', fresh=True), {'results': [], 'cached': False})
+        self.assertEqual(self.search_response('目标'), {'results': [], 'cached': False})
+        self.assertEqual(self.queries, ['目标'] * 4)
+
+    def test_unverified_results_are_retried(self):
+        self.matches['作者'] = [{'name': '作者', 'url': 'https://example.com/fixture'}]
+        path = '/api/author-search?' + urlencode({'q': '作者'})
+        self.assertEqual(self.request('GET', path)[0], 503)
+        self.matches['作者'] = [profile('作者', 'fixtureValid')]
+        self.assertFalse(self.search_response('作者')['cached'])
+        self.assertEqual(self.queries, ['作者', '作者'])
 
     def test_selected_identity_controls_same_name_results(self):
         first = profile('同名作者', 'fixtureAccount1')

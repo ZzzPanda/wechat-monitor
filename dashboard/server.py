@@ -257,18 +257,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.json_reply(400, {'error': '请在管理页中搜索。'})
                 return
             try:
-                query = parse_qs(urlsplit(self.path).query, max_num_fields=1).get('q', [])
+                params = parse_qs(urlsplit(self.path).query, max_num_fields=2, keep_blank_values=True)
             except ValueError:
-                query = []
-            if len(query) != 1 or not valid_text(query[0], 64):
+                params = {}
+            query = params.get('q', [])
+            if (len(query) != 1 or not valid_text(query[0], 64)
+                    or params.keys() - {'q', 'fresh'} or params.get('fresh', ['1']) != ['1']):
                 self.json_reply(400, {'error': '请输入 1 至 64 个字符的视频号名称。'})
                 return
             try:
-                results = self.server.selections.find(query[0].strip())
+                response = self.server.selections.find(query[0].strip(), fresh='fresh' in params)
             except SearchUnavailable as err:
                 self.json_reply(503, {'error': str(err)})
                 return
-            self.json_reply(200, dict(results=results))
+            self.json_reply(200, response)
             return
         if self.command == 'POST':
             if path != '/api/authors':

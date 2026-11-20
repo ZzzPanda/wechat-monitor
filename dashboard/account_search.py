@@ -99,34 +99,51 @@ class DesktopSearch:
 
 
 class AccountSelections:
+    cache_seconds = 600
+    cache_limit = 64
+
     def __init__(self, search):
         self.search = search
         self.lock = threading.Lock()
         self.tokens = {}
+        self.cache = {}
 
-    def find(self, query):
-        rows = self.search(query)
-        results = []
+    def issue_choices(self, accounts):
+        # Called under the lock. Each search gets its own selection tokens.
         now = time.monotonic()
-        with self.lock:
-            self.tokens = {k: v for k, v in self.tokens.items() if v[0] > now}
-            seen = set()
-            for row in rows[:30]:
-                account = profile_record(row)
-                if account is None:
-                    continue
-                identity = account.get('id') or account['url']
-                if identity in seen:
-                    continue
-                seen.add(identity)
-                token = secrets.token_urlsafe(32)
-                self.tokens[token] = (now + 600, account)
-                results.append(dict(account, token=token))
-            if rows and not results:
-                raise SearchUnavailable('微信返回了候选账号，但未能核实主页地址。请用完整账号名重试。')
-            while len(self.tokens) > 1024:
-                self.tokens.pop(next(iter(self.tokens)))
+        self.tokens = {k: v for k, v in self.tokens.items() if v[0] > now}
+        results = []
+        for account in accounts:
+            token = secrets.token_urlsafe(32)
+            self.tokens[token] = (now + 600, account)
+            results.append(dict(account, token=token))
+        while len(self.tokens) > 1024:
+            self.tokens.pop(next(iter(self.tokens)))
         return results
+
+    def find(self, query, fresh=False):
+        with self.lock:
+            entry = self.cache.get(query)
+            if not fresh and entry and entry[0] > time.monotonic():
+                return dict(results=self.issue_choices(entry[1]), cached=True)
+
+        # Leave other cached keywords and selections available during the desktop search.
+        rows = self.search(query)
+        accounts = {}
+        for row in rows[:30]:
+            account = profile_record(row)
+            if account is not None:
+                accounts.setdefault(account.get('id') or account['url'], account)
+        if rows and not accounts:
+            raise SearchUnavailable('微信返回了候选账号，但未能核实主页地址。请用完整账号名重试。')
+        verified = tuple(accounts.values())
+        with self.lock:
+            self.cache.pop(query, None)
+            if verified:
+                self.cache[query] = (time.monotonic() + self.cache_seconds, verified)
+                if len(self.cache) > self.cache_limit:
+                    self.cache.pop(next(iter(self.cache)))
+            return dict(results=self.issue_choices(verified), cached=False)
 
     def resolve(self, token):
         if isinstance(token, str):

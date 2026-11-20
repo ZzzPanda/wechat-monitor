@@ -62,7 +62,13 @@ class SearchWorkerTests(unittest.TestCase):
         self.search.assert_not_called()
 
     def test_caller_deadline_interrupts_search_and_releases_player(self):
-        self.search.side_effect = lambda q: time.sleep(2)
+        def capture(query):
+            try:
+                time.sleep(2)
+            except OSError:
+                self.fail('The request deadline must bypass per-frame capture retries.')
+
+        self.search.side_effect = capture
         self.assertIn('超时', self.reply(self.submit(ttl=.1))['error'])
         with self.lock.open('ab') as holder:
             fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)

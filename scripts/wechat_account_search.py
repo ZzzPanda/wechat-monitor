@@ -2,6 +2,7 @@
 """Find Channels profiles through the signed-in Linux WeChat search interface."""
 
 import argparse
+from contextlib import ExitStack
 import fcntl
 import io
 import json
@@ -14,6 +15,7 @@ from urllib.parse import urlencode
 import numpy as np
 from PIL import Image
 
+from wechat_frames import FrameStream
 from wechat_paths import DATA_ROOT, check_drive
 from wechat_player import Player, PlayerError, center, guest, lines, norm, runs
 
@@ -28,7 +30,7 @@ def clipboard(text):
 
 def tabs(image):
     # The Linux client draws the tabs and its square address/search button on one border.
-    pixels = np.asarray(image.convert('L'))
+    pixels = np.asarray(image.crop((0, 0, image.width, 12)).convert('L'))
     edges = [(int(a), int(b)) for a, b in runs(pixels[6] < 233) if a > 100 and b-a >= 24]
     if len(edges) < 2 or not 24 <= edges[-1][1] - edges[-1][0] <= 42:
         raise PlayerError('无法识别微信浏览器标签栏，请收起地址栏并显示视频号窗口。')
@@ -63,9 +65,9 @@ def nav_item(image, top, bottom, label):
     return None
 
 
-def cards(image, query):
+def cards(rows, query):
     # In the video-account filter, each visible avatar has a right-aligned text column.
-    column = [r for r in lines(image) if 150 <= r['x'] <= 169 and r['y'] > 245]
+    column = [r for r in rows if 150 <= r['x'] <= 169 and r['y'] > 245]
     groups = []
     for row in sorted(column, key=lambda r: r['y']):
         if not groups or row['y'] - groups[-1][-1]['y'] > 52:
@@ -145,14 +147,26 @@ def open_from_main():
 
 class AccountSearch(Player):
     def image(self):
+        if self.stream is not None:
+            # A buffered picture may predate the last click. Wait for a fresh
+            # acquisition before inspecting this new state of the window.
+            after = time.monotonic()
+            try:
+                while True:
+                    stamp, image = self.stream.read(timeout=.6)
+                    if stamp >= after:
+                        return image
+            except (OSError, RuntimeError):
+                self.stream = None
         return self._image()[1]
 
-    def tab_bar(self):
+    def tab_bar(self, image=None):
         # A tab close briefly paints the old and new active tabs simultaneously.
         for attempt in range(5):
             try:
-                return tabs(self.image())
+                return tabs(image if image is not None else self.image())
             except PlayerError:
+                image = None
                 if attempt == 4:
                     raise
                 time.sleep(.15)
@@ -162,8 +176,8 @@ class AccountSearch(Player):
         guest('sh', '-c', '[ "$(xdotool getactivewindow)" = "$1" ] || exit 1; '
               'shift; xdotool key --clearmodifiers "$@"', '_', self.window, *keys)
 
-    def address(self, value=None):
-        _, _, button = self.tab_bar()
+    def address(self, value=None, bar=None):
+        _, _, button = bar or self.tab_bar()
         self._point(button, 25, click=True)
         if value is not None:
             clipboard(value)
@@ -193,8 +207,8 @@ class AccountSearch(Player):
             time.sleep(.16)
         raise PlayerError(message)
 
-    def select_tab(self, index):
-        mids, active, _ = self.tab_bar()
+    def select_tab(self, index, bar=None):
+        mids, active, _ = bar or self.tab_bar()
         if index < len(mids) and index != active:
             self._point(mids[index], 25, click=True)
 
@@ -225,45 +239,62 @@ class AccountSearch(Player):
             ink = np.asarray(im.convert('L'))[y-11:y+10, x-25:x+25]
             if (ink < 65).sum() < 28:
                 return None
-            rows = lines(im.crop((40, 258, min(im.width, 865), im.height)))
-            if any(r['x'] in range(106, 132) for r in rows) or any(
+            left, top = 40, 246
+            rows = [dict(r, x=r['x'] + left, y=r['y'] + top)
+                    for r in lines(im.crop((left, top, min(im.width, 865), im.height)))]
+            if any(146 <= r['x'] < 172 for r in rows) or any(
                 marker in r['text'] for r in rows for marker in ('未找到', '无结果', '暂无', '没有', '未搜到')):
-                signature = [(r['y'], r['text']) for r in rows if r['x'] in range(106, 132)]
+                signature = [(r['y'], r['text']) for r in rows if 146 <= r['x'] < 172]
                 if signature == previous:
-                    return im
+                    return cards(rows, query), self.tab_bar(im)
                 previous = signature
                 time.sleep(.3)
-        im = self.wait(filtered, '微信未显示可确认的视频号搜索结果。')
-        return cards(im, query)
+        return self.wait(filtered, '微信未显示可确认的视频号搜索结果。')
 
     def find(self, query):
         ids = windows('^WeChatAppEx$') or open_from_main()
         if len(ids) != 1:
             raise PlayerError('请在已登录的微信中打开一个视频号或搜一搜窗口。')
         guest('xdotool', 'windowactivate', '--sync', ids[0])
+        self._check()
+        self.stream = None
+        with ExitStack() as stack:
+            try:
+                self.stream = stack.enter_context(FrameStream(self.window, self.size, (0, 0, *self.size), fps=12))
+            except (OSError, RuntimeError):
+                pass  # A one-shot window grab remains available on older containers.
+            try:
+                return self.find_in_window(query)
+            finally:
+                self.stream = None
+
+    def find_in_window(self, query):
         original = self.image()
-        old_tabs, old_active, _ = self.tab_bar()
+        original_bar = self.tab_bar(original)
+        old_tabs, old_active, _ = original_bar
         original_id = None
-        if any(140 < r['x'] < 255 and 60 < r['y'] < 128 for r in lines(original)):
-            original_id = self.address()
+        header = lines(original.crop((0, 0, original.width, 250)))
+        if any(140 < r['x'] < 255 and 60 < r['y'] < 128 for r in header):
+            original_id = self.address(bar=original_bar)
         search_index, owns_search = None, False
         output = []
         try:
-            matches = self.results(query)
-            current, search_index, _ = self.tab_bar()
+            matches, search_bar = self.results(query)
+            current, search_index, _ = search_bar
             owns_search = len(current) == len(old_tabs) + 1 and search_index == len(old_tabs)
             for hit in matches:
                 name = hit['text'].strip()
-                tab_count = len(self.tab_bar()[0])
+                tab_count = len(current)
                 self._point(*center(hit), click=True)
                 identity = None
                 try:
                     try:
-                        rows = self.wait(lambda im: rows_if_profile(im, name),
-                                         '微信未打开选中作者的主页。', 5)
+                        profile_image, rows = self.wait(
+                            lambda im: rows_if_profile(im, name), '微信未打开选中作者的主页。', 5)
                     except PlayerError:
                         continue
-                    identity = self.address()
+                    profile_bar = self.tab_bar(profile_image)
+                    identity = self.address(bar=profile_bar)
                     if identity and all(row['id'] != identity for row in output):
                         description = [r['text'] for r in rows if (145 < r['x'] < 220 and 120 < r['y'] < 153)
                                        or (40 < r['x'] < 90 and 185 < r['y'] < 247
@@ -272,21 +303,24 @@ class AccountSearch(Player):
                                            url=PROFILE+'?'+urlencode({'username': identity}),
                                            description=' · '.join(description)))
                 finally:
-                    if identity:
-                        opened, active, _ = self.tab_bar()
-                        if len(opened) == tab_count + 1 and active == tab_count:
-                            self.press('ctrl+w')
-                    self.select_tab(search_index)
+                    bar = self.tab_bar()
+                    opened, active, _ = bar
+                    if identity and len(opened) == tab_count + 1 and active == tab_count:
+                        self.press('ctrl+w')
+                        bar = self.tab_bar()
+                    current = bar[0]
+                    self.select_tab(search_index, bar)
             if matches and not output:
                 raise PlayerError('微信返回了候选账号，但未能核实其主页链接，请重试。')
             return output
         finally:
-            current, active, _ = self.tab_bar()
+            bar = self.tab_bar()
+            current, active, _ = bar
             # A fresh address-bar search opens a new last tab. Only close our own tab.
             if search_index is None and len(current) == len(old_tabs)+1 and active == len(old_tabs):
                 search_index, owns_search = active, True
             if search_index is not None and owns_search:
-                self.select_tab(search_index)
+                self.select_tab(search_index, bar)
                 self.press('ctrl+w')
             self.select_tab(old_active)
             if original_id and self.address() != original_id:
@@ -294,9 +328,10 @@ class AccountSearch(Player):
 
 
 def rows_if_profile(image, name):
-    rows = lines(image)
+    # The verified name, badge and description all live in the top profile header.
+    rows = lines(image.crop((0, 0, image.width, 250)))
     if profile_name(rows, name):
-        return rows
+        return image, rows
     return None
 
 

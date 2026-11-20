@@ -3,10 +3,12 @@ import io
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from wechat_account_search import READ_FINDER_ID, cards, rows_if_profile
+from wechat_account_search import AccountSearch, READ_FINDER_ID, cards, rows_if_profile
 
 
 class WeChatAccountSearchTests(unittest.TestCase):
@@ -33,11 +35,23 @@ class WeChatAccountSearchTests(unittest.TestCase):
         rows = [row('数字生命', 64, 98), row('数字生命卡兹克', 158, 308),
                 row('数字生命相关科技', 158, 344), row('其他账号', 158, 476),
                 row('讨论数字生命', 158, 512), row('数字生命地图', 158, 586)]
+        self.assertEqual([hit['text'] for hit in cards(rows, '数字生命')], ['数字生命卡兹克', '数字生命地图'])
+        self.assertEqual(cards(rows, '没人用的名字'), [])
+        image = Image.new('RGB', (1280, 720))
         with patch('wechat_account_search.lines', return_value=rows):
-            self.assertEqual([hit['text'] for hit in cards(None, '数字生命')],
-                             ['数字生命卡兹克', '数字生命地图'])
-            self.assertEqual(cards(None, '没人用的名字'), [])
-            self.assertIsNone(rows_if_profile(None, '数字生命'))
+            self.assertIsNone(rows_if_profile(image, '数字生命'))
+
+    def test_search_discards_preclick_frames_and_falls_back_when_stream_ends(self):
+        search = AccountSearch('视频号', '搜索可见的作者名片')
+        stream = search.stream = Mock()
+        stream.read.side_effect = [(99, 'old'), (101, 'current'), TimeoutError('No fresh image')]
+        with patch('wechat_account_search.time.monotonic', return_value=100):
+            self.assertEqual(search.image(), 'current')
+            self.assertEqual(stream.read.call_count, 2)
+            with patch.object(search, '_image', return_value=(102, 'single')) as grab:
+                self.assertEqual(search.image(), 'single')
+                self.assertIsNone(search.stream)
+                grab.assert_called_once_with()
 
 
 if __name__ == '__main__':

@@ -267,6 +267,7 @@ const authorQuery = byId("author-name");
 const accountOptions = byId("account-options");
 const accountList = byId("account-list");
 const searchButton = byId("search-author");
+const freshSearchButton = byId("fresh-author-search");
 const addButton = byId("submit-author");
 
 function resetAccountSearch() {
@@ -275,6 +276,7 @@ function resetAccountSearch() {
   selectedAccount = null;
   accountList.replaceChildren();
   accountOptions.hidden = true;
+  freshSearchButton.hidden = true;
   addButton.disabled = true;
   searchButton.disabled = !authorQuery.value.trim() || addingAuthor;
   byId("author-search-status").textContent = "";
@@ -340,14 +342,18 @@ byId("author-search-form").addEventListener("submit", async event => {
   event.preventDefault();
   const query = authorQuery.value.trim();
   if (!query || addingAuthor || searchController) return;
+  const fresh = event.submitter === freshSearchButton;
   resetAccountSearch();
+  if (fresh) authorQuery.focus();
   const controller = new AbortController();
   searchController = controller;
   searchButton.disabled = true;
   const status = byId("author-search-status");
   status.textContent = "正在微信桌面搜索并核对主页…";
   try {
-    const response = await fetch("/api/author-search?" + new URLSearchParams({ q: query }), {
+    const params = new URLSearchParams({ q: query });
+    if (fresh) params.set("fresh", "1");
+    const response = await fetch("/api/author-search?" + params, {
       cache: "no-store", signal: controller.signal
     });
     const data = await response.json();
@@ -357,8 +363,10 @@ byId("author-search-form").addEventListener("submit", async event => {
     for (const candidate of data.results) showCandidate(candidate);
     const count = accountList.childElementCount;
     accountOptions.hidden = count === 0;
-    status.textContent = count ? "找到 " + count + " 个账号，请核对后选择。" :
+    const summary = count ? "找到 " + count + " 个账号，请核对后选择。" :
       (data.results.length ? "这些结果没有可用的微信账号链接。" : "当前结果中没有匹配的视频号，试试完整名称。");
+    freshSearchButton.hidden = data.cached !== true;
+    status.textContent = data.cached === true ? "最近 10 分钟的微信搜索结果。" + summary : summary;
   } catch (error) {
     if (controller.signal.aborted) return;
     status.textContent = "";
@@ -375,7 +383,7 @@ addButton.addEventListener("click", async () => {
   if (addingAuthor || !selectedAccount || searchController) return;
   const account = selectedAccount;
   addingAuthor = true;
-  addButton.disabled = searchButton.disabled = authorQuery.disabled = accountOptions.disabled = true;
+  addButton.disabled = searchButton.disabled = freshSearchButton.disabled = authorQuery.disabled = accountOptions.disabled = true;
   addButton.textContent = "正在添加…";
   const closeButtons = authorDialog.querySelectorAll("[data-close]");
   closeButtons.forEach(button => { button.disabled = true; });
@@ -399,7 +407,7 @@ addButton.addEventListener("click", async () => {
     else notice(message);
   } finally {
     addingAuthor = false;
-    authorQuery.disabled = accountOptions.disabled = false;
+    freshSearchButton.disabled = authorQuery.disabled = accountOptions.disabled = false;
     searchButton.disabled = !authorQuery.value.trim() || Boolean(searchController);
     addButton.disabled = !selectedAccount;
     addButton.textContent = "加入监控名单";

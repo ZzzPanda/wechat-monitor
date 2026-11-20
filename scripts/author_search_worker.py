@@ -19,8 +19,12 @@ SEARCH_TIMEOUT = 90
 TIMEOUT_MESSAGE = '微信搜索已超时，请重新搜索。'
 
 
+class SearchDeadlineExceeded(Exception):
+    """The whole search expired, including any capture fallback."""
+
+
 def timeout_search(signum, frame):
-    raise TimeoutError(TIMEOUT_MESSAGE)
+    raise SearchDeadlineExceeded(TIMEOUT_MESSAGE)
 
 
 def run_request(path, save_lock, search):
@@ -49,7 +53,7 @@ def run_request(path, save_lock, search):
         try:
             signal.setitimer(signal.ITIMER_REAL, seconds)
             return {'results': search(query.strip())}
-        except TimeoutError:
+        except (SearchDeadlineExceeded, TimeoutError):
             return {'error': TIMEOUT_MESSAGE}
         except RuntimeError as exc:
             return {'error': str(exc)}
