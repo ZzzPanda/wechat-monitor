@@ -45,6 +45,15 @@ class PlayerLabels(unittest.TestCase):
         author = row('测试作者', 100, 888)
         self.assertEqual(player._identity([title, row('翻译', 250, 838), author]), (title, author))
 
+    def test_expand_button_follows_exact_public_headline(self):
+        player = Player('卡尔的AI沃茨', '让机器人当我的跟拍摄影师，首次开箱和公园跟拍！\n#机器人开箱')
+        player.size = (1158, 960)
+        author = row(player.author, 100, 888)
+        for ending in ('！•展升、', '！一展开', '！…展汗', '！一展天', '！总 一展开'):
+            title = row('让机器人当我的跟拍摄影师，首次开箱和公园跟拍' + ending, 36, 836)
+            self.assertEqual(player._identity([title, author]), (title, author))
+            self.assertIsNone(player._identity([dict(title, text='不同的作品标题' + ending), author]))
+
     def test_verify_open_player_from_footer_when_full_frame_ocr_misses(self):
         p = Player('测试作者', '这是一条被切开的标题')
         p.size = (1158, 960)
@@ -331,23 +340,41 @@ class PlayerLabels(unittest.TestCase):
             def read(self, timeout):
                 left, top, width, height = self.box
                 now[0] += .125
-                frame = np.full((height, width), 200 if now[0] >= 117. else 105, dtype='uint8')
+                # A cut can hide the footer briefly. Autoplay keeps the next
+                # work's different caption in that same position.
+                background = 105
+                if now[0] >= 117. or (switch_early and now[0] >= 105.):
+                    background = 200
+                elif 105. <= now[0] < 106.:
+                    background = 150
+                frame = np.full((height, width), background, dtype='uint8')
                 frame[709-top:713-top, 200-left:850-left] = 250
-                frame[704-top:716-top, 841-left:855-left] = 250
+                position = min(1., (now[0]-p.start)/p.duration)
+                handle = round(200 + 649 * position)
+                frame[704-top:716-top, handle-left-7:handle-left+7] = 250
                 return now[0], Image.fromarray(frame)
 
         def footer(image):
-            caption = '同一账号的另一个作品' if image.getpixel((0, 0)) == 200 else title
+            background = image.getpixel((0, 0))
+            if background == 150:
+                return []
+            caption = '同一账号的另一个作品' if background == 200 else title
             return [row(caption, 12, 12), row(author, 76, 63)]
 
-        for author in (p.author, '另一个账号'):
+        for author, switch_early in ((p.author, False), (p.author, True), ('另一个账号', False)):
             now[0] = p.start
-            with self.subTest(author=author), patch('wechat_frames.FrameStream', OverlayFrames), \
+            with self.subTest(author=author, switch_early=switch_early), patch('wechat_frames.FrameStream', OverlayFrames), \
                     patch('wechat_player.time.monotonic', side_effect=lambda: now[0]), \
                     patch('wechat_player.lines', side_effect=footer):
-                if author == p.author:
+                if switch_early:
+                    with self.assertRaisesRegex(PlayerError, 'Uncertain end'):
+                        p.watch()
+                    self.assertEqual(now[0], 107.5)
+                elif author == p.author:
                     seen = p.watch()
                     self.assertEqual(seen['first_change_monotonic'], 117.)
+                    self.assertEqual(seen['end_monotonic'], 116.625)
+                    self.assertLess(now[0] - 117., .5)
                     self.assertEqual(seen['last_position'], 17)
                 else:
                     with self.assertRaisesRegex(PlayerError, 'Wrong programme'):

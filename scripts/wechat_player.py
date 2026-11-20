@@ -60,6 +60,7 @@ def player_caption(rows, width, author_row, caption):
     # Vision can split one rendered line at an emoji. Reassemble adjacent boxes
     # before comparing, and keep their full bounds for the playback observer.
     wanted = caption_text(caption)
+    headline = caption_text(caption.splitlines()[0])
     candidates = []
     labels = sorted((r for r in rows if author_row["y"] - 100 <= r["y"] <= author_row["y"] - 20),
                     key=lambda r: r["x"])
@@ -85,7 +86,13 @@ def player_caption(rows, width, author_row, caption):
                 text = re.sub(r"(?<=\d)[uv]s?(?=\d)", "", text)
                 if label is first and text.isdecimal() and text != wanted:
                     continue
-            if len(text) >= min(8, len(wanted)) and (wanted.startswith(text) or text.startswith(wanted)):
+            # The footer can stop at the first public line before the hashtags.
+            # Ignore an OCR variant of the adjacent Expand button only after
+            # that entire line has matched.
+            with_button = (len(headline) >= 8 and text.startswith(headline)
+                           and len(text) - len(headline) <= 4
+                           and re.search(r"展[\u4e00-\u9fff]$", norm(label["text"])))
+            if len(text) >= min(8, len(wanted)) and (wanted.startswith(text) or text.startswith(wanted) or with_button):
                 # Prefer the full line. The next box can also be a separate UI label.
                 candidates.append(label)
                 break
@@ -873,6 +880,11 @@ class Player:
                         raise PlayerError("Wrong programme when monitoring began.")
                     if changed is None:
                         changed = stamp
+                    # Mid-play a cut or subtitles can briefly obscure native
+                    # labels. Allow them to reappear before failing the work.
+                    # At the actual tail the first changed frame still bounds the clip.
+                    if stamp - self.start < self.duration - 3 and stamp - changed < 2.5:
+                        continue
                     if stamp - changed >= 0.36:
                         if tail_clock is None and clock_future is not None and stamp - changed < 2:
                             continue
