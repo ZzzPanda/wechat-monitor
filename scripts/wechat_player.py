@@ -48,7 +48,9 @@ def norm(value):
 def caption_text(value):
     # The desktop client draws “展开” after the ellipsis; Vision may join both text boxes.
     text = unicodedata.normalize("NFKC", value)
-    text = re.sub(r"(?:[⋯….•·]+|\s+)\s*展开\s*$", "", text)
+    # Depending on the scene, Vision can lose the ellipsis, read 开 as 升,
+    # or join the button directly to the title's ending punctuation.
+    text = re.sub(r"[⋯….•·\s!?。、“”\"’]+展[开升]\s*$", "", text)
     # The standalone token AI sometimes comes back as Al/A1. Preserve words such as Alpha.
     text = re.sub(r"(?<![a-zA-Z0-9])A[lI1](?![a-zA-Z0-9])", "AI", text)
     return norm(text)

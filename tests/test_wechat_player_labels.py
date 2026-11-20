@@ -203,6 +203,8 @@ class PlayerLabels(unittest.TestCase):
         self.assertEqual(caption_text('当我用Al拍照⋯ 展开'), caption_text('当我用AI拍照'))
         self.assertNotEqual(caption_text('Alpha'), caption_text('AIpha'))
         self.assertNotEqual(caption_text('逐渐展开'), caption_text('逐渐'))
+        for ending in ('！•展升', '！展开', '！”展开', '！…、展开'):
+            self.assertEqual(caption_text('首次开箱和公园跟拍' + ending), caption_text('首次开箱和公园跟拍'))
 
     def test_clock_requires_one_reading_with_exact_duration(self):
         image = Image.new('RGB', (120, 42))
