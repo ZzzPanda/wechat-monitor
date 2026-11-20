@@ -15,5 +15,13 @@
     "release_sha256": "73a083052016fc2f35cc4c74188f6045878f04e4553685ee8cc8a2649b4e3639",
     "local_image": "local/wx-channels-server:v261106",
     "local_image_id": "sha256:f8aa9760479bd08384663b8b01344193aee6dd9b1f42089c806d73af4e03259e"
+  },
+  "dashboard": {
+    "tag": "local/wechat-monitor-dashboard:arm64-v1",
+    "platform": "linux/arm64",
+    "base": "docker.io/library/python:3.13-slim-bookworm@sha256:a5a7017efc5969e00ae2b91c8eb0631049a569652aa4ffc4501769049ae45c72",
+    "archive": "wechat-monitor-dashboard-arm64-v1.tar",
+    "archive_sha256": "dce11ccc2ee9c55d80ceab3271d5ef0e93f9f411b1eb7f18bfc3577d97a53a3e",
+    "archive_image_id": "sha256:47f25a166ec3c5f2bd20b0f9179d7f87aab86ed6e39f813f1c2edad0ff3398d0"
   }
 }

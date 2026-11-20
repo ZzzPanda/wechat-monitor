@@ -502,6 +502,16 @@ def output(data):
     print(json.dumps(data, ensure_ascii=False), flush=True)
 
 
+def update_poster(key):
+    helper = ROOT / 'deploy/posters.py'
+    if helper.is_file():
+        try:
+            subprocess.run([sys.executable, '-B', str(helper), '--key', key], check=True,
+                           stdout=subprocess.DEVNULL, timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            progress('poster_unavailable', detail=str(exc))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('save', 'status'))
@@ -532,6 +542,8 @@ def main():
                     result = save(db, url, item) if args.command == 'save' else recordings.lookup(db, url)
                     if 'path' in result:
                         result['file'] = str(recordings.media_path(result['path']))
+                    if result['status'] == 'saved':
+                        update_poster(result['work_key'])
                     output(dict(url=url, **result))
                     if result['status'] not in ('already_saved', 'saved', 'verified'):
                         result_code = max(result_code, 1)

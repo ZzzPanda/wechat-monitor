@@ -45,3 +45,7 @@ portForwards:
   guestPort: 33022
   hostIP: 127.0.0.1
   hostPort: 33022
+- guestIP: 127.0.0.1
+  guestPort: 33023
+  hostIP: 127.0.0.1
+  hostPort: 33023

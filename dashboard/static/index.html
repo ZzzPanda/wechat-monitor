@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f7f8f6">
+  <title>视频资料库 · 视频号监控台</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳至视频列表</a>
+  <div class="workspace">
+    <aside class="rail" aria-label="资料库导航">
+      <div class="brand-bar">
+        <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i></span>视频号监控台</div>
+        <button type="button" id="nav-toggle" class="nav-toggle quiet-button" aria-controls="navigation" aria-expanded="false">作者筛选<span class="chevron" aria-hidden="true"></span></button>
+      </div>
+      <nav id="navigation" class="navigation" aria-label="视频和作者">
+        <h2 class="nav-heading">资料库</h2>
+        <button type="button" id="all-videos" class="nav-item current" aria-current="page">
+          <span class="grid-icon" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+          <span class="nav-name">全部视频</span><span class="nav-count" id="all-count"></span>
+        </button>
+        <div class="author-group">
+          <h2 class="nav-heading">监控视频号</h2>
+          <div id="authors"></div>
+        </div>
+        <div id="past-group" class="author-group" hidden>
+          <h2 class="nav-heading">历史作者</h2>
+          <div id="past-authors"></div>
+        </div>
+      </nav>
+      <div class="storage" id="storage" hidden>
+        <span class="disk-icon" aria-hidden="true"></span>
+        <div><span>视频占用空间</span><strong id="storage-size"></strong></div>
+      </div>
+    </aside>
+
+    <main id="main" class="main">
+      <header class="page-header">
+        <div>
+          <h1 id="page-title">视频资料库</h1>
+          <p id="summary" class="summary" aria-live="polite">正在读取资料库…</p>
+        </div>
+        <button id="add-author" class="primary-button" type="button"><span class="plus-icon" aria-hidden="true"></span>添加视频号</button>
+      </header>
+      <section aria-label="历史视频">
+        <div class="toolbar">
+          <label class="search"><span class="search-icon" aria-hidden="true"></span>
+            <input id="query" type="search" placeholder="搜索视频或作者" aria-label="搜索视频或作者" autocomplete="off">
+          </label>
+          <div class="toolbar-actions">
+            <label class="sort">
+              <span class="sort-icon" aria-hidden="true"><i></i></span>
+              <select id="sort" aria-label="视频排序">
+                <option value="newest">最新发布</option>
+                <option value="oldest">最早发布</option>
+                <option value="title">标题排序</option>
+              </select>
+              <span class="chevron" aria-hidden="true"></span>
+            </label>
+            <button id="refresh" class="icon-button" type="button" title="刷新资料库" aria-label="刷新资料库"><span class="refresh-icon" aria-hidden="true">↻</span></button>
+          </div>
+        </div>
+        <p id="fetch-error" class="inline-error" role="alert" hidden></p>
+        <div id="videos" class="gallery" aria-label="视频列表" aria-busy="true"></div>
+        <div id="empty" class="empty-state" hidden>
+          <div class="empty-frame" aria-hidden="true"><span></span></div>
+          <h2 id="empty-title"></h2>
+          <p id="empty-text"></p>
+          <button id="clear-search" type="button" class="quiet-button" hidden>清除搜索</button>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="author-dialog" class="author-dialog" aria-labelledby="author-dialog-title">
+    <div class="dialog-titlebar">
+      <h2 id="author-dialog-title">添加监控视频号</h2>
+      <button class="close-button" type="button" aria-label="关闭" data-close="author-dialog"></button>
+    </div>
+    <p class="dialog-intro">填写作者在微信视频号中使用的显示名称。</p>
+    <form id="author-form">
+      <label for="author-name" class="field-label">视频号名称</label>
+      <input class="text-field" id="author-name" name="name" required placeholder="例如：数字生命卡兹克" autocomplete="off">
+      <p class="inline-error" id="author-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button class="quiet-button" type="button" data-close="author-dialog">取消</button>
+        <button class="primary-button" id="submit-author" type="submit">加入监控名单</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="player-dialog" class="player-dialog" aria-labelledby="playing-title">
+    <div class="player-head">
+      <div><h2 id="playing-title"></h2><p id="playing-meta"></p></div>
+      <button class="close-button" type="button" aria-label="关闭播放器" data-close="player-dialog"></button>
+    </div>
+    <video id="player" controls playsinline preload="metadata"></video>
+    <p id="player-error" class="inline-error" role="alert" hidden>视频暂时无法播放，请检查外置盘上的文件后重试。</p>
+  </dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

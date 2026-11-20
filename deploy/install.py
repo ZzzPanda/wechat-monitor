@@ -24,10 +24,9 @@ APP = VOLUME / 'wechat-monitor'
 RUNTIME = APP / 'runtime'
 SOCKET = APP / 'lima/wx/sock/docker.sock'
 DOCKER = ['docker', '--host', f'unix://{SOCKET}']
-PLAYER = json.loads((SOURCE/'deploy/images.lock.json').read_text())['player']
-IMAGE = PLAYER['tag']
-ARCHIVE = APP / 'images' / PLAYER['archive']
+IMAGES = json.loads((SOURCE/'deploy/images.lock.json').read_text())
 DESKTOP = 'http://127.0.0.1:33021/'
+DASHBOARD = 'http://127.0.0.1:33023/'
 GUEST_CHECK = """set -eu
 for cmd in ffmpeg ffprobe xdotool xprop xwininfo xsel pactl; do command -v "$cmd" >/dev/null; done
 python3 -c 'from PIL import Image; from ctypes import CDLL; CDLL("libX11.so.6")'
@@ -59,7 +58,8 @@ def check_disk():
     if disk.get('VolumeUUID') != UUID or disk.get('MountPoint') != str(VOLUME) or disk.get('Internal') is not False:
         raise RuntimeError('请挂载项目指定的 1 TB 外置盘 ssd1。')
     for path in [APP, RUNTIME, APP/'cache', APP/'lima', APP/'media', APP/'state', APP/'tmp',
-                 APP/'scripts', APP/'tests', APP/'config', APP/'images', APP/'state/wechat-pilot']:
+                 APP/'scripts', APP/'tests', APP/'config', APP/'images', APP/'state/wechat-pilot',
+                 APP/'state/monitoring', APP/'state/posters', APP/'state/dashboard-app']:
         resolved = path.resolve()
         existing = next(p for p in (resolved, *resolved.parents) if p.exists())
         if not resolved.is_relative_to(VOLUME) or existing.stat().st_dev != VOLUME.stat().st_dev:
@@ -135,9 +135,52 @@ def install_host():
                 copy_file(src, APP/folder/src.name)
     copy_file(SOURCE/'wechat-save', APP/'wechat-save')
     copy_file(SOURCE/'保存微信作品.md', APP/'保存微信作品.md')
-    authors = APP/'config/authors.txt'
-    if not authors.exists():
-        copy_file(SOURCE/'config/authors.example.txt', authors)
+    install_authors()
+
+
+def install_authors():
+    # Lima already shares state/. Keep the existing config path as an alias so
+    # both the Mac saver and the Docker dashboard always read the same names.
+    old = APP/'config/authors.txt'
+    folder = APP/'state/monitoring'
+    folder.mkdir(mode=0o700, exist_ok=True)
+    authors = folder/'authors.txt'
+    with (folder/'authors.txt.lock').open('a+b') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if old.is_symlink():
+            if old.resolve() != authors or not authors.is_file():
+                raise RuntimeError(f'作者名单链接指向意外位置或文件缺失：{old}')
+            return
+        if not authors.exists():
+            copy_file(old if old.is_file() else SOURCE/'config/authors.example.txt', authors)
+        elif old.is_file():
+            saved = authors.read_text().splitlines()
+            missing = [line for line in old.read_text().splitlines() if line.strip() and line not in saved]
+            if missing:
+                with tempfile.TemporaryDirectory(dir=folder) as stage:
+                    pending = Path(stage)/authors.name
+                    pending.write_text('\n'.join(saved+missing)+'\n')
+                    os.replace(pending,authors)
+        with tempfile.TemporaryDirectory(dir=old.parent) as stage:
+            alias = Path(stage)/old.name
+            alias.symlink_to(os.path.relpath(authors,old.parent))
+            os.replace(alias,old)
+
+
+def install_dashboard_files(deploy):
+    runtime = APP/'state/dashboard-app'
+    source = SOURCE/'dashboard'
+    assets = [source/'server.py', *sorted(p for p in (source/'static').rglob('*') if p.is_file())]
+    revision = hashlib.sha256()
+    for asset in assets:
+        name = asset.relative_to(source)
+        revision.update(name.as_posix().encode() + b'\0' + bytes.fromhex(digest(asset)))
+        copy_file(asset, runtime/name)
+    (APP/'state/posters').mkdir(mode=0o700, exist_ok=True)
+    (APP/'media/微信视频号').mkdir(exist_ok=True)
+    copy_file(source/'Dockerfile', deploy/'dashboard/Dockerfile')
+    copy_file(SOURCE/'deploy/posters.py', APP/'deploy/posters.py')
+    return revision.hexdigest()
 
 
 def start_vm():
@@ -156,21 +199,24 @@ def start_vm():
     raise RuntimeError('外盘 wx 虚拟机的 Docker 引擎未就绪。')
 
 
-def prepare_image(compose, env):
-    if subprocess.run(DOCKER+['image','inspect',IMAGE], capture_output=True).returncode == 0:
+def prepare_image(compose, env, component, service):
+    spec = IMAGES[component]
+    tag = spec['tag']
+    archive = APP/'images'/spec['archive']
+    if subprocess.run(DOCKER+['image','inspect',tag], capture_output=True).returncode == 0:
         return
-    if ARCHIVE.is_file():
-        manifest = ARCHIVE.with_suffix('.tar.sha256')
-        checksum = PLAYER['archive_sha256']
-        if (not manifest.is_file() or manifest.read_text().strip() != checksum+'  '+ARCHIVE.name
-                or digest(ARCHIVE) != checksum):
+    if archive.is_file():
+        manifest = archive.with_suffix('.tar.sha256')
+        checksum = spec['archive_sha256']
+        if (not manifest.is_file() or manifest.read_text().strip() != checksum+'  '+archive.name
+                or digest(archive) != checksum):
             raise RuntimeError(f'离线镜像校验失败，请检查 {manifest}。')
-        run(*DOCKER, 'image', 'load', '--input', ARCHIVE)
-        if output(*DOCKER, 'image', 'inspect', '--format', '{{.Id}}', IMAGE) != PLAYER['archive_image_id']:
+        run(*DOCKER, 'image', 'load', '--input', archive)
+        if output(*DOCKER, 'image', 'inspect', '--format', '{{.Id}}', tag) != spec['archive_image_id']:
             raise RuntimeError('导入后的镜像与仓库记录的镜像 ID 不一致。')
     else:
-        run(*compose, 'build', 'weixin', env=env)
-    run(*DOCKER, 'image', 'inspect', IMAGE, stdout=subprocess.DEVNULL)
+        run(*compose, 'build', service, env=env)
+    run(*DOCKER, 'image', 'inspect', tag, stdout=subprocess.DEVNULL)
 
 
 def existing_player():
@@ -223,10 +269,13 @@ def main():
         copy_file(SOURCE/'compose.yaml', deploy/'compose.yaml')
         copy_file(SOURCE/'docker/Dockerfile',deploy/'docker/Dockerfile')
         compose = [*DOCKER, 'compose','-f',str(deploy/'compose.yaml')]
-        env = dict(os.environ, WECHAT_MEDIA_DIR=str(APP/'media'))
+        revision = install_dashboard_files(deploy)
+        env = dict(os.environ, WECHAT_MEDIA_DIR=str(APP/'media'), WECHAT_STATE_DIR=str(APP/'state'),
+                   DASHBOARD_UID=str(os.getuid()), DASHBOARD_REVISION=revision)
         run(*compose,'config','--quiet',env=env)
         status = existing_player()
-        prepare_image(compose, env)
+        prepare_image(compose, env, 'player', 'weixin')
+        prepare_image(compose, env, 'dashboard', 'dashboard')
         print('正在检查播放器镜像，安装保存工具和 OCR。', flush=True)
         install_host()
         if status is None:
@@ -235,7 +284,24 @@ def main():
             run(*DOCKER,'start','wx-playback')
         elif status != 'running':
             raise RuntimeError('现有播放器状态异常：' + status)
+        previews = subprocess.run([sys.executable, '-B', str(APP/'deploy/posters.py')])
+        if previews.returncode:
+            print('部分视频暂时没有封面，仍可在管理页查看作品。', file=sys.stderr)
+        run(*compose,'up','-d','--no-build','--no-deps','dashboard',env=env)
         wait_for_desktop()
+        opener = build_opener(ProxyHandler({}))
+        for _ in range(30):
+            try:
+                with opener.open(DASHBOARD+'api/dashboard',timeout=2) as response:
+                    library = json.load(response)
+                if isinstance(library.get('videos'), list) and isinstance(library.get('authors'), list):
+                    break
+            except (URLError, OSError, ValueError):
+                pass
+            time.sleep(1)
+        else:
+            raise RuntimeError('管理页未就绪，请检查 dashboard 容器及本机 33023 端口。')
+        print('视频号管理页：' + DASHBOARD)
         print('微信桌面已就绪：' + DESKTOP)
         print('保存命令：' + str(APP/'wechat-save') + ' save <微信分享链接>')
 

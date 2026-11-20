@@ -1,6 +1,6 @@
 # 微信视频号保存工具
 
-在 Apple Silicon Mac 上，用 Docker 长期运行已登录的 Linux 微信。给 `wechat-save` 一个或多个微信视频号分享链接，它会核对作者，通过普通播放器保存画面和原声。视频、登录卷、下载缓存及任务数据库都放在指定的 1 TB 外置盘。
+在 Apple Silicon Mac 上，用 Docker 长期运行已登录的 Linux 微信。给 `wechat-save` 一个或多个微信视频号分享链接，它会核对作者，通过普通播放器保存画面和原声。用本地管理页添加视频号、浏览已保存作品和播放视频。视频、登录卷和任务数据库都放在指定的 1 TB 外置盘。
 
 ## 一键部署
 
@@ -18,13 +18,13 @@ gh repo clone ZzzPanda/wechat-monitor /Volumes/ssd1/wechat-monitor/source && /Vo
 
 在已有的 Git 工作目录中也可以直接运行 `./deploy.sh`。
 
-看到「微信桌面已就绪」后，打开 [微信桌面](http://127.0.0.1:33021/)。第一次使用在微信桌面扫码。再次部署会识别现有容器及登录卷，并在它们已停止时启动。下载、录制或其他部署正在占用播放器时，稍后重试即可。
+部署结束后，打开[视频号管理页](http://127.0.0.1:33023/)添加账号或查看历史视频。首次使用在[微信桌面](http://127.0.0.1:33021/)扫码。再次部署会识别现有容器及登录卷，并在它们已停止时启动。下载、录制或其他部署正在占用播放器时，稍后重试即可。
 
 全新环境需要 macOS 命令行开发工具（含 Python 3.9+、Swift 和 Vision SDK）、Docker CLI 及 Compose 插件、支持 `setts/prescale` 的 FFmpeg 与 ffprobe（实测 8.1），以及 Google Chrome 或 Chromium。Docker 服务由脚本在外盘的 Lima 虚拟机中启动。脚本会准备固定版本的 Lima 和含 Docker 的 Ubuntu ARM64 基础盘，载入或构建播放器镜像，编译 OCR，并在需要时把 Python 依赖安装到外盘虚拟环境。本版校验这块物理外盘的卷 UUID。
 
 ## 保存一个视频
 
-在容器的微信中打开作者主页，让目标作品卡片可见，也可以直接打开这条作品。将作者显示名逐行写入外盘 `/Volumes/ssd1/wechat-monitor/config/authors.txt`，首次部署会放入「数字生命卡兹克」作为初始值。
+在容器的微信中打开作者主页，让目标作品卡片可见，也可以直接打开这条作品。在管理页点击「添加视频号」，输入微信里显示的作者名。首次部署会放入「数字生命卡兹克」作为初始值。管理页和保存工具共用同一份名单，原有 `config/authors.txt` 路径也可继续使用。
 
 ```sh
 ./wechat-save save 'https://weixin.qq.com/sph/AaOturjvvg'
@@ -38,8 +38,9 @@ gh repo clone ZzzPanda/wechat-monitor /Volumes/ssd1/wechat-monitor/source && /Vo
 | 组件 | 部署位置 | 用途 |
 | --- | --- | --- |
 | `local/wechat-monitor-player:arm64-v1` | 外盘 Lima 的 Docker 引擎 | Linux 微信、浏览器桌面、X11、PulseAudio 和录制用 FFmpeg |
+| `local/wechat-monitor-dashboard:arm64-v1` | 同一 Docker 引擎 | 本机管理页，维护作者名单、浏览和播放外盘历史视频 |
 | `wechat-save` | Mac，代码安装在外盘 | 作者核对、Apple Vision 中文 OCR、控制播放器、成片及去重 |
-| `local/wx-channels-server:v261106` | 此机器此前的独立实验镜像 | 原项目为 `wx_channels_download`，记录其版本以便追溯；本次保存流程使用上面两项 |
+| `local/wx-channels-server:v261106` | 此机器此前的独立实验镜像 | 原项目为 `wx_channels_download`，记录其版本以便追溯；本次保存流程使用播放器和 `wechat-save` |
 
 [Compose 配置](compose.yaml) 和 [Dockerfile](docker/Dockerfile) 可用于重新构建播放器。基础镜像按 digest 固定。外盘 `images/wechat-monitor-player-arm64-v1.tar` 是已构建镜像的离线副本，大小约 1.47 GB。部署时优先使用本机已有镜像，其次从校验通过的离线归档导入，最后才联网构建。镜像归档只包含应用层。上游发行包、离线归档的 SHA-256 和实验镜像标识见[镜像清单](deploy/images.lock.json)。上游桌面使用 [LinuxServer Weixin](https://docs.linuxserver.io/images/docker-weixin/)。
 
@@ -51,6 +52,7 @@ gh repo clone ZzzPanda/wechat-monitor /Volumes/ssd1/wechat-monitor/source && /Vo
 | `scripts/`、`wechat-save` | 部署后的下载工具及入口 |
 | `media/微信视频号/` | 按作者保存的 MP4 |
 | `state/wechat-pilot/` | 作品索引、链接去重与保存锁 |
+| `state/monitoring/authors.txt`、`state/posters/` | 管理页使用的作者名单、视频帧缩略图和时长 |
 | `images/`、`cache/` | 离线 Docker 镜像和基础环境缓存 |
 | `lima/wx/` | 专用 Docker 虚拟机及登录卷所在的虚拟磁盘 |
 | `runtime/`、`tmp/` | Lima、OCR、部署配置、外盘临时文件 |

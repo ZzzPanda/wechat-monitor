@@ -27,5 +27,58 @@ services:
         target: /config/Downloads
         bind:
           create_host_path: false
+  dashboard:
+    image: local/wechat-monitor-dashboard:arm64-v1
+    build:
+      context: ./dashboard
+    pull_policy: never
+    platform: linux/arm64
+    user: "${DASHBOARD_UID:-501}:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    labels:
+      com.wechat-monitor.dashboard-source: "${DASHBOARD_REVISION:-local}"
+    environment:
+      DASHBOARD_HOST: "0.0.0.0"
+      DASHBOARD_PORT: "8080"
+      DASHBOARD_AUTHORS: /authors/authors.txt
+      DASHBOARD_DB: /db/previews.sqlite3
+      DASHBOARD_MEDIA: /media
+      DASHBOARD_POSTERS: /posters
+    ports:
+      - "127.0.0.1:33023:8080"
+    volumes:
+      - type: bind
+        source: ${WECHAT_STATE_DIR:-/Volumes/ssd1/wechat-monitor/state}/dashboard-app
+        target: /app
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WECHAT_STATE_DIR:-/Volumes/ssd1/wechat-monitor/state}/wechat-pilot
+        target: /db
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WECHAT_MEDIA_DIR:-/Volumes/ssd1/wechat-monitor/media}/微信视频号
+        target: /media
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WECHAT_STATE_DIR:-/Volumes/ssd1/wechat-monitor/state}/monitoring
+        target: /authors
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WECHAT_STATE_DIR:-/Volumes/ssd1/wechat-monitor/state}/posters
+        target: /posters
+        read_only: true
+        bind:
+          create_host_path: false
+
 volumes:
   weixin-profile:
