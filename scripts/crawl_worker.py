@@ -1,6 +1,7 @@
 """Run the dashboard's history and incremental jobs on the signed-in desktop."""
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
+import errno
 import fcntl
 import hashlib
 import json
@@ -71,8 +72,7 @@ def run_job(api, job, saver, db, discover):
             since = datetime.fromtimestamp(prior['since'], beijing).date().isoformat()
     entry = dict(name=name, url=profile)
     details = {}
-    errors = []
-    consecutive_errors = 0
+    failed_keys = set()
     processed = 0
 
     def stopped():
@@ -104,17 +104,19 @@ def run_job(api, job, saver, db, discover):
         return api('known', profile_url=profile, key=work['fingerprint'])['known']
 
     def handle(url):
-        nonlocal consecutive_errors, processed
+        nonlocal processed
         if stopped():
             return
-        link = url
+        item = None
+        key = None
         try:
-            key = None
             item = metadata(url)
             key = item['fingerprint']
             record = api('record', id=job_id, url=url, key=key)['item']
             link = record['url']
-            if record['status'] in ('saved', 'skipped', 'baseline'):
+            # The same card may return another share URL after scrolling. Give
+            # each failed work one attempt per pass, including after recovery.
+            if record['status'] in ('saved', 'skipped', 'baseline') or key in failed_keys:
                 return
             if mode == 'baseline':
                 status = 'baseline'
@@ -128,18 +130,21 @@ def run_job(api, job, saver, db, discover):
                 else:
                     raise ValueError('作品尚未保存完成。')
             api('item_done', id=job_id, url=link, status=status)
-            consecutive_errors = 0
             processed += 1
         except item_errors as exc:
             message = str(exc)[:350] or '作品处理失败。'
+            title = (item or {}).get('caption', '').splitlines()
+            if title:
+                message = f'《{title[0][:65]}》{message}'
             if key is None:
-                placeholder = 'unresolved:' + hashlib.sha256(url.encode()).hexdigest()
-                link = api('record', id=job_id, url=url, key=placeholder)['item']['url']
+                key = 'unresolved:' + hashlib.sha256(url.encode()).hexdigest()
+                link = api('record', id=job_id, url=url, key=key)['item']['url']
             api('item_done', id=job_id, url=link, status='failed', error=message)
-            errors.append(message)
-            consecutive_errors += 1
-            if consecutive_errors >= 3 or getattr(exc, 'status', '') in ('disk_full', 'disk_unavailable'):
-                raise RuntimeError(message) from exc
+            if (getattr(exc, 'status', '') in ('disk_full', 'disk_unavailable', 'runtime_unavailable', 'preview_unavailable')
+                    or getattr(exc, 'errno', None) in (errno.ENOSPC, errno.EROFS, errno.ENODEV, errno.EIO)
+                    or isinstance(exc, sqlite3.OperationalError)):
+                raise RuntimeError(f'采集已停止。{message}') from exc
+            failed_keys.add(key)
         finally:
             details.pop(url, None)
 
@@ -147,8 +152,11 @@ def run_job(api, job, saver, db, discover):
         outcome = discover(entry, mode=mode, known=known, on_work=handle, should_stop=stopped)
         if stopped():
             status, message = 'cancelled', '任务已停止或监控名单已变更。'
-        elif not outcome['complete'] or errors:
-            status, message = 'partial', ' '.join(filter(None, [outcome.get('reason'), *errors[-1:]]))
+        elif not outcome['complete'] or failed_keys:
+            status, message = 'partial', outcome.get('reason', '')
+            if failed_keys:
+                detail = f'{len(failed_keys)} 条作品处理失败，可重新拉取历史作品重试。'
+                message = '；'.join(filter(None, (message, detail)))
         else:
             status = 'done'
             message = ('已记录首批作品，后续定时任务保存新增作品。' if mode == 'baseline'
@@ -157,7 +165,7 @@ def run_job(api, job, saver, db, discover):
         # A dashboard restart must leave the job recoverable on the next connection.
         raise
     except Exception as exc:
-        status = 'partial' if processed or errors else 'failed'
+        status = 'partial' if processed or failed_keys else 'failed'
         message = str(exc)[:400] or '采集未完成。'
     api('finish', id=job_id, status=status, error=message[:500])
 

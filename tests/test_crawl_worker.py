@@ -7,7 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 root = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(root/'dashboard' if (root/'dashboard/server.py').is_file() else root/'state/dashboard-app'),
@@ -59,7 +59,8 @@ class CrawlWorkerTests(unittest.TestCase):
 
     def work(self, db, url, *, fetch):
         self.assertTrue(fetch)
-        return dict(author=self.entry['name'], fingerprint=self.urls[url], published=self.dates.get(url))
+        return dict(author=self.entry['name'], fingerprint=self.urls[url],
+                    published=self.dates.get(url), caption=self.urls[url] + '的视频')
 
     def save(self, db, url, item, *, return_to_profile):
         self.assertFalse(return_to_profile)
@@ -129,6 +130,28 @@ class CrawlWorkerTests(unittest.TestCase):
         result = self.run_grid('incremental', [first, middle, old])
         self.assertEqual((result['status'], result['saved'], result['skipped']), ('done', 1, 1))
         self.assertEqual(self.saved, ['new','middle','new','middle'])
+
+    def test_history_continues_past_failed_works_and_attempts_each_fingerprint_once(self):
+        urls = [self.share(key) for key in ('one', 'two', 'three', 'four')]
+        self.fail.update(('one', 'two', 'three'))
+        aliases = [self.share('one', 'anotherOne'), self.share('three', 'anotherThree')]
+        partial = self.run_grid('history', [*urls[:3], *aliases, urls[3]])
+        self.assertEqual((partial['status'], partial['saved'], partial['failed']), ('partial', 1, 3))
+        self.assertEqual(self.saved, ['one', 'two', 'three', 'four'])
+        self.assertIn('模拟微信列表末尾', partial['error'])
+        self.assertIn('3 条作品处理失败', partial['error'])
+        self.assertIn('three的视频', partial['item_error'])
+        self.fail.clear()
+        retry = self.run_grid('history', [aliases[0], urls[1], aliases[1], urls[3]])
+        self.assertEqual((retry['status'], retry['saved'], retry['skipped']), ('done', 3, 1))
+
+    def test_unavailable_shared_runtime_stops_before_the_next_work(self):
+        unavailable = RuntimeError('无法连接微信容器')
+        unavailable.status = 'runtime_unavailable'
+        with patch.dict(self.saver, save=Mock(side_effect=unavailable)):
+            result = self.run_grid('history', [self.share('one'), self.share('two')])
+        self.assertEqual((result['status'], result['discovered'], result['failed']), ('failed', 1, 1))
+        self.assertIn('无法连接微信容器', result['error'])
 
     def test_removed_boundary_does_not_turn_older_history_into_new_video(self):
         from datetime import datetime, timedelta, timezone

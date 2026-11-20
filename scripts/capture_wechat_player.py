@@ -205,6 +205,12 @@ def check_aac_clock(packets):
     """Audit 48 kHz AAC-LC frame starts in the recording's millisecond time base."""
     if len(packets) < 2:
         raise RuntimeError('Missing AAC packet timestamps.')
+    # Pulse's clock can run slightly faster or slower than exactly 48 kHz.
+    # Keep the recorded PTS when they fit a stable clock within 100 ppm;
+    # check individual frames against that clock to catch real jumps.
+    samples = (len(packets) - 1) * 1024
+    drift = (packets[-1] - packets[0]) * 48 - samples
+    skew_per_frame = drift / (len(packets) - 1) if 2400 < abs(drift) <= samples * .0001 else 0
     repair = False
     prior = packets[0]
     for i in range(1, len(packets)):
@@ -231,7 +237,7 @@ def check_aac_clock(packets):
             repair = True
         # One AAC-LC frame is 1024 samples. Never bridge a missing frame,
         # a substantial clock reversal, or accumulating audio sample loss.
-        if not 10 <= stamp - prior <= 33 or abs((stamp - packets[0]) * 48 - i * 1024) > 2400:
+        if not 10 <= stamp - prior <= 33 or abs((stamp - packets[0]) * 48 - i * (1024 + skew_per_frame)) > 2400:
             raise RuntimeError(f'AAC timestamp discontinuity at packet {i}.')
         prior = stamp
     return repair

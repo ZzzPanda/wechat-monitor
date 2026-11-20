@@ -54,6 +54,42 @@ def caption_text(value):
     return norm(text)
 
 
+def player_caption(rows, width, author_row, caption):
+    # Vision can split one rendered line at an emoji. Reassemble adjacent boxes
+    # before comparing, and keep their full bounds for the playback observer.
+    wanted = caption_text(caption)
+    candidates = []
+    labels = sorted((r for r in rows if author_row["y"] - 100 <= r["y"] <= author_row["y"] - 20),
+                    key=lambda r: r["x"])
+    for i, first in enumerate(labels):
+        if first["x"] > .10 * width:
+            break
+        merged = first.copy()
+        for following in labels[i+1:]:
+            gap = following["x"] - (merged["x"] + merged["width"])
+            if gap > max(24, first["height"]):
+                break
+            if gap < -2 or abs(center(first)[1] - center(following)[1]) > first["height"] * .35:
+                continue
+            merged["text"] += " " + following["text"]
+            merged["width"] = following["x"] + following["width"] - first["x"]
+            bottom = max(merged["y"] + merged["height"], following["y"] + following["height"])
+            merged["y"] = min(merged["y"], following["y"])
+            merged["height"] = bottom - merged["y"]
+        for label in (merged, first):
+            text = caption_text(label["text"])
+            if "🆚" in caption:
+                # The live desktop read a comparison between years as both 'u' and 'uS'.
+                text = re.sub(r"(?<=\d)[uv]s?(?=\d)", "", text)
+                if label is first and text.isdecimal() and text != wanted:
+                    continue
+            if len(text) >= min(8, len(wanted)) and (wanted.startswith(text) or text.startswith(wanted)):
+                # Prefer the full line. The next box can also be a separate UI label.
+                candidates.append(label)
+                break
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def author_matches(text, author):
     # Vision can join the account name, its verification badge and the follow status.
     name = unicodedata.normalize("NFKC", text).strip()
@@ -269,19 +305,10 @@ class Player:
             and r["y"] > 0.78 * h
             and author_matches(r["text"], self.author)
         ]
-        wanted = caption_text(self.caption)
         for name in names:
-            candidates = []
-            for r in rows:
-                text = caption_text(r["text"])
-                if r["x"] > 0.10 * w or not (name["y"] - 100 <= r["y"] <= name["y"] - 20):
-                    continue
-                if len(text) >= min(8, len(wanted)) and (
-                    wanted.startswith(text) or text.startswith(wanted)
-                ):
-                    candidates.append(r)
-            if len(candidates) == 1:
-                return candidates[0], name
+            title = player_caption(rows, w, name, self.caption)
+            if title:
+                return title, name
         return None
 
     def _open_card(self, rows):
@@ -303,21 +330,46 @@ class Player:
             )
         self._point(*center(candidates[0]), click=True)
 
+    def _sampled_footer_matches(self, image, left, top):
+        # Only read the native footer of this timestamped frame. The picture
+        # and its subtitles can contain unrelated account names and titles.
+        x, y, w, h = self.identity_box
+        x0, y0 = max(0, x-left-12), max(0, y-top-12)
+        footer = image.crop((x0, y0, min(image.width, x-left+w+12), min(image.height, y-top+h+12)))
+        # Fine glyphs and punctuation over moving footage sometimes resolve
+        # only at a larger scale. Both reads use the very same source frame.
+        for scale in (1, 2):
+            sample = footer if scale == 1 else footer.resize((footer.width * scale, footer.height * scale))
+            rows = [dict(row, x=left+x0+row['x']//scale, y=top+y0+row['y']//scale,
+                         width=row['width']//scale, height=row['height']//scale) for row in lines(sample)]
+            pair = self._identity(rows)
+            if pair is not None and all(
+                    abs(row['x'] - initial['x']) <= 12 and abs(row['y'] - initial['y']) <= 12
+                    for row, initial in zip(pair, (self.title, self.name))):
+                return True
+        return False
+
     def _inspect(self, allow_open=False):
-        _, im = self._image()
-        rows = lines(im)
-        pair = self._identity(rows)
-        if not pair and allow_open:
-            self._open_card(rows)
-            deadline = time.monotonic() + 8
-            while time.monotonic() < deadline:
-                _, im = self._image()
-                rows = lines(im)
-                pair = self._identity(rows)
-                if pair:
-                    break
-        if not pair:
-            raise PlayerError("The visible author and caption do not both match this work.")
+        deadline = time.monotonic() + 2
+        while True:
+            _, im = self._image()
+            rows = lines(im)
+            pair = self._identity(rows)
+            if not pair:
+                # Over moving footage Vision sometimes reads a footer only in
+                # isolation. Keep coordinates on the original frame.
+                top = int(im.height * .68)
+                footer = lines(im.crop((0, top, im.width, im.height)))
+                pair = self._identity([dict(row, y=row["y"] + top) for row in footer])
+            if pair:
+                break
+            if allow_open and author_profile(rows, self.author, self.size):
+                self._open_card(rows)
+                allow_open = False
+                deadline = time.monotonic() + 8
+            if time.monotonic() >= deadline:
+                raise PlayerError("The visible author and caption do not both match this work.")
+            time.sleep(.12)
         title, name = pair
         self.title = title
         self.name = name
@@ -347,11 +399,21 @@ class Player:
     def _toolbar(self):
         # Hover between known caption and picture. Derive buttons from the rendered time text and seek track.
         tx, ty = self.title["x"], self.title["y"]
-        # The raised toolbar can move with pointer/letterbox state. OCR only its
-        # left-hand label column, including both observed toolbar heights.
+        # The raised toolbar can move with pointer/letterbox state.
         top = max(55, ty - 245)
         trailer = (0, top, self.size[0], ty + 10 - top)
         portrait = self._has_pillarbox()
+
+        def clock_labels(image, x_offset=0, y_offset=0):
+            labels = []
+            for row in lines(image):
+                x, y = row["x"] + x_offset, row["y"] + y_offset
+                if not (64 <= x < .20 * self.size[0] and 0 <= y < trailer[3]):
+                    continue
+                for match in CLOCK.finditer(unicodedata.normalize("NFKC", row["text"])):
+                    labels.append((dict(row, x=x, y=y), match))
+            return labels
+
         deadline = time.monotonic() + 4
         move = False
         while True:
@@ -365,22 +427,22 @@ class Player:
             # Vision sometimes merges the native play triangle into the left edge
             # of the clock box. Re-read the digits beyond the icon's right edge,
             # keeping their window-relative x for subsequent button recognition.
-            clocks = []
             for inset in (0, 68, 65, 70):
                 region = im.crop((inset, 0, im.width // 4, im.height))
-                clocks = []
-                for row in lines(region):
-                    match = CLOCK.search(unicodedata.normalize("NFKC", row["text"]))
-                    x = row["x"] + inset
-                    if match and 64 <= x < 0.20 * self.size[0]:
-                        clocks.append((dict(row, x=x), match))
+                clocks = clock_labels(region, x_offset=inset)
                 if len(clocks) == 1:
                     break
+            if len(clocks) != 1:
+                # Vision can identify the clock in context even when every
+                # narrow crop loses it. Validate controls on that same frame.
+                _, window = self._image()
+                clocks = clock_labels(window, y_offset=-top)
+                im = window.crop((0, top, window.width, top + trailer[3]))
             if len(clocks) == 1:
                 row, m = clocks[0]
                 position = int(m[1]) * 60 + int(m[2])
                 duration = int(m[3]) * 60 + int(m[4])
-                if duration:
+                if duration and position <= duration:
                     break
             if time.monotonic() >= deadline:
                 raise PlayerError("Cannot read a ready, unambiguous player clock.")
@@ -621,17 +683,24 @@ class Player:
             time.sleep(0.12)
         raise PlayerError("WeChat did not update its copied share link.")
 
-    def _start_playback(self):
-        stamp = time.monotonic()
-        self._point(*self.controls["seek"], click=True)
-        state = self._toolbar()
-        if state["paused"] and state["position"] <= 1:
+    def _start_playback(self, state):
+        for attempt in range(3):
+            # Seeking from the prepared opening can start, pause or advance
+            # playback. Use its actual play button when it is already ready.
+            control = "button" if state["paused"] and state["position"] <= 1 else "seek"
             stamp = time.monotonic()
-            self._point(*self.controls["button"], click=True)
+            self._point(*self.controls[control], click=True)
             state = self._toolbar()
-        if state["paused"] or state["position"] > 3:
-            raise PlayerError("Unconfirmed start. Discard this capture.")
-        return stamp
+            if control == "button" and state["paused"] and state["position"] <= 1:
+                # The first sampled frame can still show the old paused icon.
+                time.sleep(.15)
+                state = self._toolbar()
+            if not state["paused"] and state["position"] <= max(3, time.monotonic() - stamp + 1):
+                return stamp
+            if attempt < 2:
+                self._inspect()
+        raise PlayerError(f"无法确认从片头开始播放，最后读到 {state['position']} 秒"
+                          f"（{'暂停' if state['paused'] else '播放中'}）。")
 
     def restart(self):
         self._inspect()
@@ -644,7 +713,7 @@ class Player:
         # A short portrait work has a measured black gutter to the left of the
         # picture. It exposes the first portion of the real seek track and knob.
         if self.duration > 60 or not self.crop or self.crop[3] <= self.crop[2] or self.crop[0] - lx < 55:
-            self.start = self._start_playback()
+            self.start = self._start_playback(state)
             return self.start
         from wechat_frames import FrameStream
         top = max(55, cy - 124)
@@ -660,7 +729,7 @@ class Player:
 
             observation = reader.submit(observe)
             try:
-                clicked = self._start_playback()
+                clicked = self._start_playback(state)
                 self.start = clicked
                 deadline = time.monotonic() + 1.25
                 while time.monotonic() < deadline:
@@ -686,13 +755,17 @@ class Player:
         lx -= 1
         rx = self.controls["right"]
         clock_left = self.controls.get("clock_left")
-        left = min(tx, lx - 12, clock_left - 7 if clock_left is not None else tx)
+        left = max(0, min(tx - 12, lx - 12, clock_left - 7 if clock_left is not None else tx))
         top = max(55, min(ty - 220, cy - 130))
-        right = max(tx + tw, rx + 12)
-        bottom = max(ty + th, cy + 16)
+        right = min(self.size[0], max(tx + tw + 12, rx + 12))
+        bottom = min(self.size[1], max(ty + th + 12, cy + 16))
         box = (left, top, right - left, bottom - top)
         recent_pos = 0
         last_good = changed = tail_clock = None
+        last_footer_read = None
+        # A solid, bright background makes binary overlap a poor identifier.
+        # Such a template may match an unrelated bright scene after autoplay.
+        use_pixels = self.name is None or all(ref.mean() < .75 for ref in self.reference)
         start_wall = None
         clock_future = clock_stamp = clock_source = None
         coarse_slider = self.duration > rx - lx - 1
@@ -732,7 +805,18 @@ class Player:
                     (mat[region] & ref).sum() / max(1, (mat[region] | ref).sum())
                     for region, ref in zip(self.identity_regions, self.reference)
                 ]
-                if min(matches) >= 0.80:
+                same_work = use_pixels and min(matches) >= .80
+                if not same_work and self.name is not None:
+                    # Moving footage behind the native labels changes many
+                    # pixels without changing the title or account. Sample
+                    # text periodically in the middle, and every frame at the
+                    # tail so the transition bounds use real observations.
+                    if (last_footer_read is not None and changed is None
+                            and stamp - self.start < self.duration - 14 and stamp - last_footer_read < .8):
+                        continue
+                    same_work = self._sampled_footer_matches(img, left, top)
+                    last_footer_read = stamp
+                if same_work:
                     if last_good is None and hasattr(stamp, 'guest_wall'):
                         if not 0 <= stamp-self.start <= 6:
                             raise PlayerError("No early X11 clock observation near the confirmed playback start.")

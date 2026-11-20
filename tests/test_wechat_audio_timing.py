@@ -140,7 +140,7 @@ class RecordedAudioClock(unittest.TestCase):
             with self.subTest(stamps=stamps), self.assertRaises(RuntimeError):
                 capture.check_aac_clock(stamps)
 
-    def test_long_timing_preserves_offsets_and_rejects_accumulated_drift(self):
+    def test_long_timing_preserves_offsets_and_rejects_erratic_or_excessive_drift(self):
         count = 1520 * 48000 // 1024
         # A measured 25 ms clock difference over 25:20 still fits the 50 ms
         # limit and is preserved by the strict copy path.
@@ -148,8 +148,20 @@ class RecordedAudioClock(unittest.TestCase):
         self.assertFalse(capture.check_aac_clock(packets))
         packets[-10] = packets[-11]
         self.assertTrue(capture.check_aac_clock(packets))
-        for i in range(count):
-            packets[i] += round(40 * i / count)
+        # A real 35-minute capture accumulated -72 ms despite every adjacent
+        # pair being only 20–22 ms apart. Keep its original packet times.
+        count = 99915
+        smooth = [round(i * 1024 / 48 - 72 * i / count) for i in range(count)]
+        self.assertEqual(capture.audio_remux_options(smooth), [])
+        # A temporary loss of sync in the middle must not be explained by
+        # the average clock rate, even with plausible individual intervals.
+        middle = count // 2
+        for i in range(middle - 100, middle + 100):
+            smooth[i] += 100 - abs(i - middle)
+        with self.assertRaisesRegex(RuntimeError, 'discontinuity'):
+            capture.check_aac_clock(smooth)
+        for i in range(len(packets)):
+            packets[i] += round(200 * i / len(packets))
         with self.assertRaisesRegex(RuntimeError, 'discontinuity'):
             capture.check_aac_clock(packets)
 

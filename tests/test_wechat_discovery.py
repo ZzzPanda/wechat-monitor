@@ -65,9 +65,12 @@ class DiscoveryTests(unittest.TestCase):
         delivered, report = self.traverse([[1, 2]], 'history', end=False)
         self.assertFalse(report['complete'])
         self.assertEqual(delivered, ['url-1','url-2'])
-        delivered, report = self.traverse([[1, 2]], 'history', failed=[1])
+        with self.assertLogs(level='WARNING') as output:
+            delivered, report = self.traverse([[1, 2]], 'history', failed=[1])
         self.assertFalse(report['complete'])
         self.assertEqual(delivered, ['url-2'])
+        self.assertIn('unavailable card', report['reason'])
+        self.assertIn('unavailable card', output.output[0])
 
     def test_thumbnail_edge_detects_last_partial_row(self):
         image = Image.new('RGB', (1000, 700), 'white')

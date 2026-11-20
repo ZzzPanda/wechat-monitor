@@ -252,9 +252,9 @@ def check_playback_timing(duration, elapsed, tail):
     if (not math.isfinite(transition_gap) or not 0 <= transition_gap <= 0.95 or
             not math.isfinite(last_position) or not duration - (1 if duration <= 60 else 2) <= last_position <= duration):
         raise SaveError('incomplete_playback', '末段进度或最后确认画面到切集的间隔不足以验证正片。')
-    # Browser startup and clock rounding allow small excess. A stalled take must
-    # not inherit the recording process's much larger timeout/cleanup budget.
-    excess = min(5.0, 1.0 + 0.01 * duration)
+    # The UI clock excludes brief buffering after we click play. Accept that
+    # lead-in when the observed end still belongs to this work.
+    excess = min(8.0, 2.0 + 0.03 * duration)
     if not math.isfinite(elapsed) or not duration - 1.0 <= elapsed <= duration + excess:
         raise SaveError('incomplete_playback',
                         f'界面时长 {duration:g} 秒，实录 {elapsed:.3f} 秒，'

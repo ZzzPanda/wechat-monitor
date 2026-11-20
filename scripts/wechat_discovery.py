@@ -1,5 +1,6 @@
 """Enumerate works through the visible, signed-in WeChat Channels profile."""
 import hashlib
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -177,6 +178,7 @@ def crawl_profile(entry, *, mode, known, on_work, should_stop):
     url, identity = resolved_profile(entry)
     profile.open_profile(url, identity)
     processed = failures = known_run = still = 0
+    last_card_error = ''
     previous_image = None
     previous_cards = []
     previous_layout = None
@@ -184,7 +186,7 @@ def crawl_profile(entry, *, mode, known, on_work, should_stop):
 
     def result(detail, success=True):
         if failures:
-            detail += f'；{failures} 张作品卡未能核验分享链接'
+            detail += f'；{failures} 张作品卡未能核验分享链接。最近原因：{last_card_error}'
         return dict(complete=bool(success and not failures), reason=detail)
 
     while not should_stop():
@@ -213,8 +215,11 @@ def crawl_profile(entry, *, mode, known, on_work, should_stop):
             try:
                 try:
                     work_url = profile.open_work(card)
-                except (PlayerError, ValueError):
+                except (PlayerError, ValueError) as exc:
                     failures += 1
+                    last_card_error = str(exc)[:200]
+                    logging.warning('%s 的作品卡 (%d, %d) 未能核验：%s',
+                                    entry['name'], card.x, card.y, last_card_error)
                     continue
                 if work_url in seen:
                     continue
