@@ -2,13 +2,84 @@
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import numpy as np
 from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'scripts'))
 import wechat_discovery as discovery
+
+
+class ProfileRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.page = discovery.ProfileDiscovery('测试作者')
+        self.page.image = Mock()
+        self.page.address = Mock(return_value='target@finder')
+        self.page._point = Mock()
+        self.page.tab_bar = Mock(return_value=([150], 0, 220))
+        self.page.press = Mock()
+        self.page.wait = Mock()
+        self.frame = Image.new('RGB', (1158, 960))
+        self.rows = [dict(x=x, y=y, width=70, height=22, text=text) for x, y, text in (
+            (204, 301, '喔唷，崩溃啦！'), (202, 356, '显示此网页时出了点问题。'),
+            (204, 402, '错误代码：9'), (862, 458, '重新加载'), (202, 460, '了解详情'))]
+        self.url = discovery.PROFILE + '?username=target%40finder'
+        for obj, key, options in [(discovery, 'windows', {'return_value': ['window']}),
+                                  (discovery, 'guest', {}), (discovery.time, 'sleep', {})]:
+            mocked = patch.object(obj, key, **options)
+            mocked.start()
+            self.addCleanup(mocked.stop)
+
+    def test_only_confirmed_crash_page_can_reload(self):
+        for rows, expected in (
+                (self.rows, ('9', self.rows[3])),
+                (self.rows + [self.rows[3]], ('9', None)),
+                (self.rows[:3], ('9', None)),
+                (self.rows[1:], None),
+                ([dict(self.rows[0], text='请完成安全验证'), self.rows[3]], None)):
+            with self.subTest(rows=rows), patch.object(discovery, 'lines', return_value=rows):
+                self.assertEqual(discovery.renderer_crash(self.frame), expected)
+
+    def test_crash_before_navigation_is_reloaded_once_and_identity_verified(self):
+        self.page.image.return_value = self.frame
+        with patch.object(discovery, 'lines', return_value=self.rows), self.assertLogs(level='WARNING'):
+            self.page.open_profile(self.url, 'target@finder')
+        self.page._point.assert_called_once_with(897, 469, click=True)
+        self.assertEqual(self.page.address.call_args_list, [call(self.url), call()])
+        self.assertEqual(self.page.profile_id, 'target@finder')
+
+    def test_crash_after_navigation_retries_original_url_and_rejects_wrong_account(self):
+        self.page.image.return_value = self.frame
+        self.page.wait.side_effect = [discovery.PlayerError('未打开主页'), True, True]
+        self.page.address.return_value = 'another@finder'
+        with patch.object(discovery, 'lines', side_effect=[[], self.rows]), self.assertLogs(level='WARNING'):
+            with self.assertRaisesRegex(discovery.PlayerError, '标识不一致'):
+                self.page.open_profile(self.url, 'target@finder')
+        self.page._point.assert_called_once()
+        self.assertEqual(self.page.address.call_args_list, [call(self.url), call(self.url), call()])
+        self.page.press.assert_not_called()
+
+    def test_persistent_crash_reports_error_code_and_stops_after_one_reload(self):
+        self.page.image.return_value = self.frame
+        def no_recovery(read, error, seconds):
+            self.assertFalse(read(self.frame))
+            raise discovery.PlayerError(error)
+        self.page.wait.side_effect = no_recovery
+        with patch.object(discovery, 'lines', return_value=self.rows), self.assertLogs(level='WARNING'):
+            with self.assertRaisesRegex(discovery.PlayerError, '错误代码 9.*仍显示崩溃页'):
+                self.page.open_profile(self.url, 'target@finder')
+        self.page._point.assert_called_once()
+        self.page.address.assert_not_called()
+
+    def test_other_load_failure_is_not_retried(self):
+        self.page.image.return_value = self.frame
+        self.page.wait.side_effect = discovery.PlayerError('微信未打开指定作者的主页。')
+        with patch.object(discovery, 'lines', return_value=[self.rows[3]]):
+            with self.assertRaisesRegex(discovery.PlayerError, '未打开指定作者'):
+                self.page.open_profile(self.url, 'target@finder')
+        self.page._point.assert_not_called()
+        self.page.address.assert_called_once_with(self.url)
 
 
 class DiscoveryTests(unittest.TestCase):

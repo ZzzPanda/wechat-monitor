@@ -12,7 +12,7 @@ from PIL import Image
 
 from wechat_account_search import AccountSearch, PROFILE, open_from_main, profile_name, search_accounts, windows
 from wechat_paths import check_drive
-from wechat_player import PlayerError, author_matches, guest, lines, runs
+from wechat_player import PlayerError, author_matches, center, guest, lines, norm, runs
 
 BASELINE_WORKS = 10
 PINNED_SLOTS = 3
@@ -116,6 +116,25 @@ def footer(image, name):
     return image, author, caption
 
 
+def renderer_crash(image):
+    """Read Chromium's crash page inside the Channels window, excluding the tab bar."""
+    rows = [(r, norm(r['text'])) for r in lines(image) if r['y'] > 60]
+    heading = next((r for r, text in rows if text == '喔唷崩溃啦'), None)
+    if heading is None:
+        return None
+    body = [(r, text) for r, text in rows if r['y'] > heading['y'] and abs(r['x'] - heading['x']) < 35]
+    detail = next((r for r, text in body if text == '显示此网页时出了点问题'), None)
+    if detail is None:
+        return None
+    for row, text in body:
+        code = re.fullmatch(r'错误代码(\d{1,8})', text)
+        if code and row['y'] > detail['y']:
+            buttons = [r for r, label in rows if label == '重新加载']
+            button = buttons[0] if len(buttons) == 1 and buttons[0]['y'] > row['y'] else None
+            return code[1], button
+    return None
+
+
 class ProfileDiscovery(AccountSearch):
     def __init__(self, name):
         super().__init__(name, '读取主页上的公开作品')
@@ -126,8 +145,25 @@ class ProfileDiscovery(AccountSearch):
         if len(ids) != 1:
             raise PlayerError('请在微信桌面保留一个视频号窗口。')
         guest('xdotool', 'windowactivate', '--sync', ids[0])
-        self.address(url)
-        self.wait(self._header_name, '微信未打开指定作者的主页。', 12)
+        crash = renderer_crash(self.image())
+        if crash is None:
+            self.address(url)
+            try:
+                self.wait(self._header_name, '微信未打开指定作者的主页。', 12)
+            except PlayerError:
+                crash = renderer_crash(self.image())
+                if crash is None:
+                    raise
+        if crash is not None:
+            code, button = crash
+            problem = f'视频号内置网页崩溃（错误代码 {code}）'
+            if button is None:
+                raise PlayerError(f'{problem}，未找到唯一的「重新加载」按钮。')
+            logging.warning('%s，正在重新加载以打开%s的主页。', problem, self.author)
+            self._point(*center(button), click=True)
+            self.wait(lambda im: renderer_crash(im) is None, f'{problem}，点击重新加载后仍显示崩溃页。', 8)
+            self.address(url)
+            self.wait(self._header_name, f'{problem}，重新加载后未能核实指定作者的主页。', 12)
         actual = self.address()
         if not actual or (identity and actual != identity):
             raise PlayerError('打开的微信主页与所选视频号标识不一致。')
