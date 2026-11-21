@@ -60,7 +60,8 @@ class CrawlQueueTests(unittest.TestCase):
         self.assertEqual(self.queue.schedule(entries, now=anchor - 1), [])
         self.assertEqual(len(self.queue.schedule(entries, now=anchor)), 1)
         self.assertEqual(self.queue.snapshot()['settings']['next_run'], anchor + day)
-        self.assertEqual(self.queue.claim(entries)['mode'], 'incremental')
+        with patch('crawl_queue.time.time', return_value=anchor):
+            self.assertEqual(self.queue.claim(entries)['mode'], 'incremental')
         first = self.queue.snapshot()['jobs'][0]['id']
         self.queue.finish(first, 'done')
         self.queue = Queue(self.path)
@@ -93,6 +94,82 @@ class CrawlQueueTests(unittest.TestCase):
         self.assertFalse(self.queue.has_queued())
         self.queue.enqueue(self.author)
         self.assertIsNone(self.queue.claim([]))
+
+    def test_boundary_yields_after_item_then_drains_whole_incremental_round_and_resumes(self):
+        peer = dict(name='另一个作者', url='https://weixin.qq.com/f/other')
+        entries = [self.author, peer]
+        with patch('crawl_queue.time.time', return_value=100):
+            self.queue.configure(True, 60, start_at=200)
+            job = self.start()
+            self.queue.record(job, 'one', 'key1')
+            self.queue.item_done(job, 'one', 'saved')
+            self.queue.record(job, 'two', 'key2')
+            self.queue.item_done(job, 'two', 'failed', '无法打开')
+            self.assertFalse(self.queue.yield_history(job, {'next': 1}))
+        cursor = {'page': 7, 'next': 2, 'signature': '页内定位'}
+        def boundary():
+            return self.queue.activity(job, self.author['name'], self.author['url'], entries, boundary=True)
+        with patch('crawl_queue.time.time', return_value=200), ThreadPoolExecutor(max_workers=3) as pool:
+            at_boundary = pool.submit(boundary)
+            heartbeat = pool.submit(self.queue.schedule, entries)
+            at_claim = pool.submit(self.queue.claim, entries)
+            self.assertEqual(at_boundary.result(), dict(active=True, yield_requested=True))
+            heartbeat.result()
+            self.assertIsNone(at_claim.result())
+        self.assertFalse(self.queue.activity(job, peer['name'], peer['url'], entries)['active'])
+        self.assertTrue(self.queue.yield_history(job, cursor))
+        self.assertFalse(self.queue.yield_history(job, {'next': 42}))
+        self.assertEqual(self.queue.enqueue(self.author)['id'], job)
+        before = {row['id']: row for row in self.queue.snapshot()['jobs']}
+        self.assertEqual(len(before), 3)
+        self.assertEqual((before[job]['status'], before[job]['saved'], before[job]['failed']), ('queued', 1, 1))
+        self.assertIn('增量', before[job]['error'])
+        self.assertNotIn('checkpoint', before[job])
+        self.queue = Queue(self.path)
+        clock = patch('crawl_queue.time.time', return_value=300)
+        clock.start()
+        self.addCleanup(clock.stop)
+        for author in entries:
+            first = self.queue.claim(entries)
+            self.assertEqual((first['mode'], first['author']), ('incremental', author['name']))
+            self.assertFalse(self.queue.yield_history(first['id'], cursor))
+            self.queue.finish(first['id'], 'done')
+        latest = self.queue.claim(entries)
+        self.assertEqual((latest['id'], latest['checkpoint'], latest['error']), (job, cursor, ''))
+        self.assertEqual(self.queue.recover(), 1)
+        self.assertEqual(self.queue.claim(entries)['checkpoint'], cursor)
+        result = self.queue.finish(job, 'done', '列表到底')
+        self.assertEqual((result['status'], result['saved'], result['failed']), ('partial', 1, 1))
+        self.assertIn('1 条作品处理失败', result['error'])
+        self.assertFalse(self.queue.yield_history(job, {}))
+        with self.queue.db() as db:
+            self.assertIsNone(db.execute('SELECT 1 FROM history_checkpoints').fetchone())
+
+    def test_claim_enqueues_due_incremental_without_heartbeat(self):
+        with patch('crawl_queue.time.time', return_value=100):
+            self.queue.configure(True, 60, start_at=200)
+            job = self.queue.enqueue(self.author)
+        with patch('crawl_queue.time.time', return_value=200):
+            claimed = self.queue.claim([self.author])
+            self.assertEqual(claimed['mode'], 'incremental')
+            self.assertFalse(self.queue.activity(claimed['id'], self.author['name'], self.author['url'],
+                                                [self.author], boundary=True)['yield_requested'])
+            self.queue.finish(claimed['id'], 'done')
+            history = self.queue.claim([self.author])
+            self.assertEqual((history['id'], history['checkpoint']), (job['id'], None))
+
+    def test_withdrawn_incremental_and_cancelled_history_cannot_be_yielded(self):
+        job = self.start()
+        inc = self.queue.enqueue(self.author, 'incremental')
+        self.assertTrue(self.queue.activity(job, self.author['name'], self.author['url'], [self.author])['yield_requested'])
+        self.queue.cancel(inc['id'])
+        self.assertFalse(self.queue.yield_history(job, {}))
+        inc = self.queue.enqueue(self.author, 'incremental')
+        self.queue.cancel(job)
+        self.assertFalse(self.queue.yield_history(job, {}))
+        self.assertEqual(self.queue.claim([self.author])['id'], inc['id'])
+        self.queue.finish(inc['id'], 'done')
+        self.assertIsNone(self.queue.claim([self.author]))
 
     def test_recovery_preserves_item_identity_and_retries_failures(self):
         job = self.start()
@@ -215,6 +292,19 @@ class CrawlQueueTests(unittest.TestCase):
         self.assertEqual(len(jobs), 50)
         self.assertEqual(jobs[0]['author'], '旧显示名50')
         self.assertTrue(self.queue.known(self.author['url'], 'key'))
+
+    def test_old_yielded_and_running_jobs_stay_visible_ahead_of_last_fifty_results(self):
+        history = self.start()
+        incremental = self.queue.enqueue(self.author, 'incremental')['id']
+        self.assertTrue(self.queue.yield_history(history, {'next': 3}))
+        self.assertEqual(self.queue.claim([self.author])['id'], incremental)
+        for index in range(51):
+            self.queue.enqueue(dict(name=f'未关联作者{index}', url=None))
+        jobs = self.queue.snapshot()['jobs']
+        self.assertEqual(len(jobs), 52)
+        self.assertEqual((jobs[0]['id'], jobs[0]['status']), (incremental, 'running'))
+        self.assertEqual((jobs[1]['id'], jobs[1]['status']), (history, 'queued'))
+        self.assertEqual((jobs[2]['author'], jobs[-1]['author']), ('未关联作者50', '未关联作者1'))
 
 
 if __name__ == '__main__':

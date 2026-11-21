@@ -74,9 +74,16 @@ def run_job(api, job, saver, db, discover):
     details = {}
     failed_keys = set()
     processed = 0
+    checkpoint = job.get('checkpoint')
 
     def stopped():
         return not api('active', id=job_id, author=name, profile_url=profile)['active']
+
+    def yield_at_boundary(position):
+        state = api('active', id=job_id, author=name, profile_url=profile, boundary=True)
+        if not state.get('yield_requested'):
+            return False
+        return api('yield_history', id=job_id, checkpoint=position)['yielded']
 
     def metadata(url):
         if not saver['preview'].SHARE_URL.fullmatch(url):
@@ -116,7 +123,8 @@ def run_job(api, job, saver, db, discover):
             link = record['url']
             # The same card may return another share URL after scrolling. Give
             # each failed work one attempt per pass, including after recovery.
-            if record['status'] in ('saved', 'skipped', 'baseline') or key in failed_keys:
+            if (record['status'] in ('saved', 'skipped', 'baseline') or key in failed_keys
+                    or (checkpoint is not None and record['status'] == 'failed')):
                 return
             if mode == 'baseline':
                 status = 'baseline'
@@ -149,14 +157,16 @@ def run_job(api, job, saver, db, discover):
             details.pop(url, None)
 
     try:
-        outcome = discover(entry, mode=mode, known=known, on_work=handle, should_stop=stopped)
+        resume = dict(checkpoint=checkpoint, on_boundary=yield_at_boundary) if mode == 'history' else {}
+        outcome = discover(entry, mode=mode, known=known, on_work=handle, should_stop=stopped, **resume)
+        if outcome.get('yielded'):
+            # The same job is already queued with its checkpoint. A finish or
+            # cancellation here would discard the remainder of the history scan.
+            return
         if stopped():
             status, message = 'cancelled', '任务已停止或监控名单已变更。'
         elif not outcome['complete'] or failed_keys:
             status, message = 'partial', outcome.get('reason', '')
-            if failed_keys:
-                detail = f'{len(failed_keys)} 条作品处理失败，可重新拉取历史作品重试。'
-                message = '；'.join(filter(None, (message, detail)))
         else:
             status = 'done'
             message = ('已记录首批作品，后续定时任务保存新增作品。' if mode == 'baseline'

@@ -1,6 +1,7 @@
 """Durable scheduling and progress for the single WeChat collection worker."""
 from contextlib import closing, contextmanager
 import hashlib
+import json
 from pathlib import Path
 import sqlite3
 import threading
@@ -20,6 +21,15 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS jobs_by_status ON jobs(status, created_at);
 CREATE INDEX IF NOT EXISTS jobs_by_profile ON jobs(profile_url, status);
+CREATE TABLE IF NOT EXISTS history_checkpoints (
+    job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    cursor TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS clear_completed_history_checkpoint AFTER UPDATE OF status ON jobs
+WHEN NEW.status IN ('done','partial','failed','cancelled')
+BEGIN
+    DELETE FROM history_checkpoints WHERE job_id=NEW.id;
+END;
 CREATE TABLE IF NOT EXISTS items (
     job_id TEXT NOT NULL REFERENCES jobs(id), work_key TEXT NOT NULL, url TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending', error TEXT NOT NULL DEFAULT '',
@@ -40,6 +50,7 @@ SELECT j.*,
 FROM jobs j LEFT JOIN items i ON i.job_id=j.id
 """
 SUCCESS = ('saved', 'skipped', 'baseline')
+QUEUED_INCREMENTAL = "SELECT 1 FROM jobs WHERE status='queued' AND mode='incremental' LIMIT 1"
 LAST_UNIX_SECOND = 253402300799  # 9999-12-31 23:59:59 UTC
 
 
@@ -105,10 +116,16 @@ class Queue:
 
     def snapshot(self):
         with self.db() as db:
-            # Limit the job IDs before joining the potentially large item table.
+            # A long-running history scan can outlive many scheduled rounds.
+            # Keep every active job alongside the latest 50 finished jobs.
             rows = db.execute(JOB_SELECT + """
-                WHERE j.id IN (SELECT id FROM jobs ORDER BY created_at DESC,rowid DESC LIMIT 50)
-                GROUP BY j.id ORDER BY j.created_at DESC,j.rowid DESC""")
+                WHERE j.status IN ('running','queued') OR j.id IN (
+                    SELECT id FROM jobs WHERE status NOT IN ('running','queued')
+                    ORDER BY created_at DESC,rowid DESC LIMIT 50
+                )
+                GROUP BY j.id
+                ORDER BY CASE j.status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
+                         j.created_at DESC,j.rowid DESC""")
             return dict(settings=settings_row(db), jobs=[dict(r) for r in rows])
 
     def configure(self, enabled, interval_minutes, start_at=None):
@@ -150,13 +167,16 @@ class Queue:
     def schedule(self, entries, now=None):
         now = int(time.time() if now is None else now)
         with self.db(write=True) as db:
-            config = settings_row(db)
-            if not config['enabled'] or now < config['next_run']:
-                return []
-            job_ids = [self._enqueue(db, entry, 'incremental', now) for entry in entries]
-            due = next_slot(config['start_at'], config['interval_minutes'], now + 1)
-            db.execute('UPDATE settings SET next_run=?', (due,))
-            return job_ids
+            return self._schedule_due(db, entries, now)
+
+    def _schedule_due(self, db, entries, now):
+        config = settings_row(db)
+        if not config['enabled'] or now < config['next_run']:
+            return []
+        job_ids = [self._enqueue(db, entry, 'incremental', now) for entry in entries]
+        due = next_slot(config['start_at'], config['interval_minutes'], now + 1)
+        db.execute('UPDATE settings SET next_run=?', (due,))
+        return job_ids
 
     def recover(self):
         with self.db(write=True) as db:
@@ -171,6 +191,35 @@ class Queue:
         with self.db() as db:
             return bool(db.execute("SELECT 1 FROM jobs WHERE id=? AND status='running'", (job_id,)).fetchone())
 
+    def activity(self, job_id, author, profile_url, entries, boundary=False):
+        if not any(e['name'] == author and e['url'] == profile_url for e in entries):
+            return dict(active=False, yield_requested=False)
+        with self.db(write=boundary) as db:
+            row = db.execute("""SELECT mode FROM jobs WHERE id=? AND author=? AND profile_url=?
+                                AND status='running'""", (job_id, author, profile_url)).fetchone()
+            if row is None:
+                return dict(active=False, yield_requested=False)
+            if boundary:
+                # Enqueue a slot that fell due between heartbeats before the next video starts.
+                self._schedule_due(db, entries, int(time.time()))
+            waiting = row['mode'] == 'history' and bool(db.execute(QUEUED_INCREMENTAL).fetchone())
+            return dict(active=True, yield_requested=waiting)
+
+    def yield_history(self, job_id, checkpoint):
+        if not isinstance(checkpoint, dict):
+            raise ValueError('历史任务的断点格式无效。')
+        cursor = json.dumps(checkpoint, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
+        with self.db(write=True) as db:
+            moved = db.execute(f"""UPDATE jobs SET status='queued',error=?,updated_at=?
+                                   WHERE id=? AND mode='history' AND status='running'
+                                   AND EXISTS ({QUEUED_INCREMENTAL})""",
+                               ('等待定时增量完成后继续', int(time.time()), job_id))
+            if not moved.rowcount:
+                return False
+            db.execute("""INSERT INTO history_checkpoints(job_id,cursor) VALUES(?,?)
+                          ON CONFLICT(job_id) DO UPDATE SET cursor=excluded.cursor""", (job_id, cursor))
+            return True
+
     def cancel(self, job_id):
         with self.db(write=True) as db:
             db.execute("""UPDATE jobs SET status='cancelled',error=?,updated_at=?
@@ -182,16 +231,23 @@ class Queue:
         tracked = {entry['name']: entry.get('url') for entry in entries}
         now = int(time.time())
         with self.db(write=True) as db:
+            self._schedule_due(db, entries, now)
+            if db.execute("SELECT 1 FROM jobs WHERE status='running' LIMIT 1").fetchone():
+                return None
             rows = db.execute("""SELECT id,author,profile_url FROM jobs WHERE status='queued'
-                                 ORDER BY CASE WHEN mode='history' THEN 0 ELSE 1 END,created_at,rowid""").fetchall()
+                                 ORDER BY CASE WHEN mode='incremental' THEN 0 ELSE 1 END,created_at,rowid""").fetchall()
             for row in rows:
                 job_id = row['id']
                 if not row['profile_url'] or tracked.get(row['author']) != row['profile_url']:
                     db.execute("UPDATE jobs SET status='cancelled',error=?,updated_at=? WHERE id=?",
                                ('监控名单中的账号已移除或更换。', now, job_id))
                     continue
-                db.execute("UPDATE jobs SET status='running',updated_at=? WHERE id=?", (now, job_id))
-                return job_row(db, job_id)
+                db.execute("UPDATE jobs SET status='running',error='',updated_at=? WHERE id=?", (now, job_id))
+                job = job_row(db, job_id)
+                if job['mode'] == 'history':
+                    saved = db.execute('SELECT cursor FROM history_checkpoints WHERE job_id=?', (job_id,)).fetchone()
+                    job['checkpoint'] = json.loads(saved['cursor']) if saved else None
+                return job
             return None
 
     def record(self, job_id, url, key):
@@ -244,9 +300,17 @@ class Queue:
                 return job_row(db, job_id)
             if current != 'running':
                 raise ValueError('该采集任务未在运行。')
-            if status == 'done' and db.execute("""SELECT 1 FROM items WHERE job_id=?
-                        AND status IN ('pending','failed') LIMIT 1""", (job_id,)).fetchone():
-                status, error = 'partial', error or '仍有作品未处理完成。'
+            if status != 'cancelled':
+                counts = dict(db.execute('SELECT status,count(*) FROM items WHERE job_id=? GROUP BY status',
+                                         (job_id,)).fetchall())
+                failed, pending = counts.get('failed', 0), counts.get('pending', 0)
+                if ((status == 'done' and (failed or pending)) or
+                        (status == 'failed' and any(counts.get(s) for s in SUCCESS))):
+                    status = 'partial'
+                if failed:
+                    error = '；'.join(filter(None, (error, f'{failed} 条作品处理失败，可重新拉取历史作品重试。')))
+                if pending:
+                    error = '；'.join(filter(None, (error, f'{pending} 条作品尚未处理完成。')))
             db.execute('UPDATE jobs SET status=?,error=?,updated_at=? WHERE id=?',
                        (status, error, int(time.time()), job_id))
             return job_row(db, job_id)

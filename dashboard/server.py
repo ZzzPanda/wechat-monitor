@@ -530,8 +530,12 @@ class DashboardServer(ThreadingHTTPServer):
         elif op == 'claim':
             return dict(job=queue.claim(self.library.entries()))
         elif op == 'active':
-            return dict(active=queue.is_running(data['id']) and any(
-                e['name'] == data['author'] and e['url'] == data['profile_url'] for e in self.library.entries()))
+            boundary = data.get('boundary', False)
+            if type(boundary) is not bool:
+                raise ValueError('作品边界标记无效。')
+            return queue.activity(data['id'], data['author'], data['profile_url'], self.library.entries(), boundary)
+        elif op == 'yield_history':
+            return dict(yielded=queue.yield_history(data['id'], data['checkpoint']))
         elif op == 'recover':
             queue.recover()
         elif op == 'seen_before':

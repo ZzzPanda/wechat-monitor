@@ -4,6 +4,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from itertools import chain, count
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import numpy as np
@@ -167,29 +168,27 @@ class ProfileDiscovery(AccountSearch):
         time.sleep(.5)
 
 
-def crawl_profile(entry, *, mode, known, on_work, should_stop):
-    """Caller owns the saver lock. on_work(url) runs while its verified player is open."""
-    if mode not in ('baseline', 'history', 'incremental'):
-        raise ValueError('未知的作品采集模式。')
-    check_drive()
-    if should_stop():
-        return dict(complete=False, reason='已停止')
-    profile = ProfileDiscovery(entry['name'])
-    url, identity = resolved_profile(entry)
-    profile.open_profile(url, identity)
-    processed = failures = known_run = still = 0
-    last_card_error = ''
-    previous_image = None
+@dataclass
+class GridPage:
+    number: int
+    head: str
+    prefix: str
+    digest: str
+    resumable: bool
+    cards: list
+    repeated: set
+    at_end: bool
+    stalled: bool
+
+
+def grid_pages(profile):
+    """Read overlapping views in order, retaining only the previous screenshot."""
+    previous_image = previous_layout = None
     previous_cards = []
-    previous_layout = None
-    seen = set()
-
-    def result(detail, success=True):
-        if failures:
-            detail += f'；{failures} 张作品卡未能核验分享链接。最近原因：{last_card_error}'
-        return dict(complete=bool(success and not failures), reason=detail)
-
-    while not should_stop():
+    still = 0
+    head = prefix = ''
+    resumable = True
+    for number in count():
         im = profile.image()
         cards = tiles(im)
         region = im.crop((30, 147, im.width-30, im.height-12))
@@ -202,16 +201,92 @@ def crawl_profile(entry, *, mode, known, on_work, should_stop):
         if previous_image is not None:
             identical = (abs(snapshot-previous_image) > 12).mean() < .012
             still = still + 1 if identical or (cards and previous_layout == layout) else 0
-        previous_image, previous_layout = snapshot, layout
         at_end = any(abs(r['x'] + r['width']/2 + 20 - im.width/2) < im.width*.04
                      and re.fullmatch(r'[\s·—\-]*(?:没有更多了|暂无视频|暂无作品|还没有作品|没有更多作品)[\s·—\-]*',
                                       r['text'].strip()) for r in markers)
-        for card in cards:
+        # Ignore mutable counters. Keep card order, columns, cover fingerprints and
+        # all visible captions; the rolling digest authenticates every skipped view.
+        cover_keys = [(card.x, card.signature.hex()) for card in cards]
+        digest = hashlib.sha256(repr((cover_keys, captions)).encode()).hexdigest()
+        if cards and len({card.signature for card in cards}) < 2 and not captions:
+            resumable = False
+        if number == 0:
+            head = digest
+        yield GridPage(number, head, prefix, digest, resumable, cards, repeated, at_end, still >= 3)
+        if at_end or still >= 3:
+            return
+        prefix = hashlib.sha256((prefix + digest).encode('ascii')).hexdigest()
+        previous_image, previous_layout, previous_cards = snapshot, layout, cards
+        profile.scroll()
+
+
+def crawl_profile(entry, *, mode, known, on_work, should_stop, checkpoint=None, on_boundary=None):
+    """Only offer the player to another job between cards, on the verified profile."""
+    if mode not in ('baseline', 'history', 'incremental'):
+        raise ValueError('未知的作品采集模式。')
+    check_drive()
+    if should_stop():
+        return dict(complete=False, reason='已停止')
+    profile = ProfileDiscovery(entry['name'])
+    url, identity = resolved_profile(entry)
+    profile.open_profile(url, identity)
+    processed = failures = known_run = offset = 0
+    last_card_error = ''
+    seen = set()
+    yielded = dict(complete=False, yielded=True, reason='等待定时增量完成后继续')
+
+    def result(detail, success=True):
+        if failures:
+            detail += f'；{failures} 张作品卡未能核验分享链接。最近原因：{last_card_error}'
+        return dict(complete=bool(success and not failures), reason=detail)
+
+    pages = grid_pages(profile)
+    if (mode == 'history' and isinstance(checkpoint, dict) and checkpoint.get('v') == 1
+            and all(type(checkpoint.get(k)) is int and checkpoint[k] >= 0
+                    for k in ('page', 'next', 'processed', 'failures'))):
+        failures = checkpoint['failures']
+        last_card_error = str(checkpoint.get('last_error', ''))[:200]
+        # Replay scrolls without opening any work. A new/deleted/reordered card
+        # anywhere in the prefix invalidates the shortcut. Re-enumeration then
+        # reuses the same job's durable work records in the worker.
+        restored = False
+        for page in pages:
             if should_stop():
                 return result('已停止', False)
-            if card in repeated:
+            if on_boundary and on_boundary(checkpoint):
+                return yielded
+            if page.head != checkpoint.get('head') or not page.resumable:
+                break
+            if page.number == checkpoint['page']:
+                if (page.prefix == checkpoint.get('prefix') and page.digest == checkpoint.get('view')
+                        and checkpoint['next'] <= len(page.cards)):
+                    restored = True
+                    offset = checkpoint['next']
+                    processed = checkpoint['processed']
+                    pages = chain((page,), pages)
+                break
+        if not restored:
+            # Count the new traversal once. Verified items already have durable
+            # job records, while inaccessible cards will be checked again here.
+            failures = 0
+            last_card_error = ''
+            profile.open_profile(url, identity)
+            pages = grid_pages(profile)
+
+    for page in pages:
+        for index in range(offset, len(page.cards) + 1):
+            if should_stop():
+                return result('已停止', False)
+            if mode == 'history' and on_boundary and on_boundary(dict(
+                    v=1, page=page.number, next=index, head=page.head, prefix=page.prefix, view=page.digest,
+                    processed=processed, failures=failures, last_error=last_card_error)):
+                return yielded
+            if index == len(page.cards):
+                break
+            card = page.cards[index]
+            if card in page.repeated:
                 continue
-            count = len(profile.tab_bar()[0])
+            tab_count = len(profile.tab_bar()[0])
             try:
                 try:
                     work_url = profile.open_work(card)
@@ -232,16 +307,14 @@ def crawl_profile(entry, *, mode, known, on_work, should_stop):
                 processed += 1
                 known_run = known_run + 1 if was_known and processed > PINNED_SLOTS else 0
             finally:
-                profile.return_to_grid(count)
+                profile.return_to_grid(tab_count)
             # Do not use the first three (possibly pinned) cards as a history boundary.
             if mode == 'incremental' and known_run >= KNOWN_BOUNDARY:
                 return result('置顶位置之后已连续遇到 3 个历史作品')
             if mode == 'baseline' and processed >= BASELINE_WORKS:
                 return result(f'已建立最近 {processed} 条作品的增量基线')
-        if at_end:
+        if page.at_end:
             return result(f'微信显示列表到底，核实 {processed} 条')
-        if still >= 3:
+        if page.stalled:
             return result(f'微信列表滚动后未继续加载，已核实 {processed} 条；未确认列表底部', False)
-        previous_cards = cards
-        profile.scroll()
-    return result('已停止', False)
+        offset = 0

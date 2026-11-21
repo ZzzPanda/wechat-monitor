@@ -80,7 +80,7 @@ class CrawlWorkerTests(unittest.TestCase):
         self.assertEqual(job['id'], job_id)
         self.active_job = job_id
 
-        def discover(entry, *, mode, known, on_work, should_stop):
+        def discover(entry, *, mode, known, on_work, should_stop, checkpoint=None, on_boundary=None):
             self.assertEqual((entry['name'], entry['url']), (self.entry['name'], self.entry['url']))
             self.modes.append(mode)
             for url in urls:
@@ -92,6 +92,60 @@ class CrawlWorkerTests(unittest.TestCase):
 
         crawl_worker.run_job(self.api, job, self.saver, self.downloads, discover)
         return next(row for row in self.queue.snapshot()['jobs'] if row['id'] == job_id)
+
+    def test_hourly_round_runs_between_two_history_saves_then_resumes_same_job(self):
+        old, new, first, second = [self.share(key) for key in ('old', 'new', 'first', 'second')]
+        self.run_grid('incremental', [old])
+        self.server.library.add_author(dict(name='第二个账号', url='https://weixin.qq.com/f/second'))
+        history = self.queue.enqueue(self.entry)['id']
+        job = self.api('claim')['job']
+        self.assertEqual(job['id'], history)
+        positions = []
+
+        def history_grid(entry, *, mode, known, on_work, should_stop, checkpoint, on_boundary):
+            offset = checkpoint['offset'] if checkpoint else 0
+            positions.append(offset)
+            for i in range(offset, 2):
+                if on_boundary({'offset': i}):
+                    return {'yielded': True}
+                on_work((first, second)[i])
+            return dict(complete=True, reason='列表到底')
+
+        def time_reached_during_save():
+            self.after_save = None
+            scheduled = self.queue.schedule(self.server.library.entries(), now=self.queue.snapshot()['settings']['next_run'])
+            self.assertEqual(len(scheduled), 2)
+            current = next(j for j in self.queue.snapshot()['jobs'] if j['id'] == history)
+            self.assertEqual((current['status'], current['saved']), ('running', 0))
+
+        self.after_save = time_reached_during_save
+        crawl_worker.run_job(self.api, job, self.saver, self.downloads, history_grid)
+        waiting = next(j for j in self.queue.snapshot()['jobs'] if j['id'] == history)
+        self.assertEqual((waiting['status'], waiting['saved'], self.saved), ('queued', 1, ['first']))
+        self.assertEqual(self.queue.enqueue(self.entry)['id'], history)
+
+        def incremental_grid(entry, *, mode, known, on_work, should_stop):
+            if entry['name'] == self.entry['name']:
+                self.assertFalse(known(new))
+                on_work(new)
+                return dict(complete=True, reason='增量检查结束')
+            return dict(complete=False, reason='一张作品卡未能核验')
+
+        accounts = []
+        for _ in range(2):
+            increment = self.api('claim')['job']
+            self.assertEqual(increment['mode'], 'incremental')
+            accounts.append(increment['author'])
+            crawl_worker.run_job(self.api, increment, self.saver, self.downloads, incremental_grid)
+        self.assertCountEqual(accounts, [self.entry['name'], '第二个账号'])
+        peer_job = next(j for j in self.queue.snapshot()['jobs'] if j['author'] == '第二个账号')
+        self.assertEqual(peer_job['status'], 'partial')
+        resumed = self.api('claim')['job']
+        self.assertEqual((resumed['id'], resumed['saved']), (history, 1))
+        crawl_worker.run_job(self.api, resumed, self.saver, self.downloads, history_grid)
+        result = next(j for j in self.queue.snapshot()['jobs'] if j['id'] == history)
+        self.assertEqual((result['status'], result['saved'], positions), ('done', 2, [0, 1]))
+        self.assertEqual(self.saved, ['first', 'new', 'second'])
 
     def test_first_incremental_baselines_then_only_new_fingerprints_are_saved(self):
         old = self.share('old')

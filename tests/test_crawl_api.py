@@ -98,10 +98,22 @@ class CrawlApiTests(unittest.TestCase):
         self.assertFalse(worker('known', profile_url=self.author['url'], key='key')['known'])
         self.assertEqual(worker('record', id=job_id, url='share', key='key')['item']['status'], 'pending')
         worker('item_done', id=job_id, url='share', status='saved')
+        fields = dict(id=job_id, author=self.author['name'], profile_url=self.author['url'], boundary=True)
+        self.assertEqual(worker('active', **fields), dict(active=True, yield_requested=False))
+        self.server.crawls.enqueue(self.author, 'incremental')
+        self.assertEqual(worker('active', **fields), dict(active=True, yield_requested=True))
+        self.assertEqual(self.request('POST', path, dict(op='yield_history', id=job_id, checkpoint=[]), credential)[0], 400)
+        self.assertTrue(worker('yield_history', id=job_id, checkpoint={'page': 2})['yielded'])
+        self.assertFalse(worker('active', **fields)['active'])
+        incremental = worker('claim')['job']
+        self.assertEqual(incremental['mode'], 'incremental')
+        worker('finish', id=incremental['id'], status='done')
+        resumed = worker('claim')['job']
+        self.assertEqual((resumed['id'], resumed['saved'], resumed['checkpoint']), (job_id, 1, {'page': 2}))
         worker('finish', id=job_id, status='done')
         self.assertTrue(worker('known', profile_url=self.author['url'], key='key')['known'])
         self.assertTrue(worker('seen_before', profile_url=self.author['url'])['known'])
-        saved = self.request('GET', '/api/crawls')[1]['jobs'][0]
+        saved = next(j for j in self.request('GET', '/api/crawls')[1]['jobs'] if j['id'] == job_id)
         self.assertEqual((saved['status'], saved['discovered'], saved['saved']), ('done', 1, 1))
 
 
