@@ -28,16 +28,30 @@ def clipboard(text):
     guest('sh', '-c', 'printf %s "$1" | xsel --clipboard --input', '_', text)
 
 
+class AmbiguousActiveTab(PlayerError):
+    """The native tab strip does not show a single selected tab."""
+
+
 def tabs(image):
-    # The Linux client draws the tabs and its square address/search button on one border.
+    # The Linux client draws its tabs and address control along the same top edge.
     pixels = np.asarray(image.crop((0, 0, image.width, 12)).convert('L'))
     edges = [(int(a), int(b)) for a, b in runs(pixels[6] < 233) if a > 100 and b-a >= 24]
-    if len(edges) < 2 or not 24 <= edges[-1][1] - edges[-1][0] <= 42:
-        raise PlayerError('无法识别微信浏览器标签栏，请收起地址栏并显示视频号窗口。')
+    if len(edges) < 2:
+        raise PlayerError('无法识别微信浏览器标签栏。')
+    left, right = edges[-1]
+    if right - left > 42:
+        # After reloading a crashed page, the native address field can remain
+        # expanded. Check its green outline on all four sides before clicking.
+        band = np.asarray(image.crop((left-5, 6, right+5, 47)).convert('RGB'), dtype='int16')
+        green = (band[:, :, 1] - band[:, :, 0] > 45) & (band[:, :, 1] - band[:, :, 2] > 25)
+        if (right-left < 96 or not green[[0, -1], 9:-9].all()
+                or not green[9:30, :10].any(axis=1).all()
+                or not green[9:30, -10:].any(axis=1).all()):
+            raise PlayerError('无法识别微信浏览器的地址输入框。')
     mids = [(a + b) // 2 for a, b in edges]
     active = [i for i, x in enumerate(mids[:-1]) if pixels[10, x] > 245]
     if len(active) != 1:
-        raise PlayerError('无法确定微信当前打开的标签页。')
+        raise AmbiguousActiveTab('无法确定微信当前打开的标签页。')
     return mids[:-1], active[0], mids[-1]
 
 
@@ -161,14 +175,21 @@ class AccountSearch(Player):
         return self._image()[1]
 
     def tab_bar(self, image=None):
-        # A tab close briefly paints the old and new active tabs simultaneously.
+        moved_pointer = False
         for attempt in range(5):
             try:
-                return tabs(image if image is not None else self.image())
-            except PlayerError:
-                image = None
+                if image is None:
+                    image = self.image()
+                return tabs(image)
+            except PlayerError as exc:
                 if attempt == 4:
                     raise
+                if isinstance(exc, AmbiguousActiveTab) and not moved_pointer:
+                    # Hover paints an inactive tab white as well. Leave the strip
+                    # without clicking, then inspect a fresh frame of the window.
+                    self._point(image.width - 128, 72)
+                    moved_pointer = True
+                image = None
                 time.sleep(.15)
 
     def press(self, *keys):
@@ -185,7 +206,7 @@ class AccountSearch(Player):
             return
         clipboard('wechat-profile-selection')
         try:
-            self.press('ctrl+c')
+            self.press('ctrl+a', 'ctrl+c')
             for _ in range(5):
                 identity = guest('python3', '-c', READ_FINDER_ID).decode().strip()
                 if identity:
