@@ -107,6 +107,74 @@ class WeChatAccountSearchTests(unittest.TestCase):
         self.assertEqual(search.press.call_args_list, [call('ctrl+a', 'ctrl+c'), call('Escape')])
         self.assertEqual(clipboard.call_args_list, [call('wechat-profile-selection'), call('')])
 
+    def test_search_releases_its_tabs_when_a_candidate_cannot_be_verified(self):
+        search = AccountSearch('视频号', '搜索可见的作者名片')
+        image = Image.new('RGB', (1158, 720), 'white')
+        names = ['original', 'another original']
+        active = 0
+        def bar(*args):
+            return list(range(len(names))), active, 800
+        def append(name):
+            nonlocal active
+            names.append(name)
+            active = len(names) - 1
+        def select(index, bar):
+            nonlocal active
+            active = index
+        def close(key):
+            nonlocal active
+            self.assertEqual(key, 'ctrl+w')
+            self.assertNotIn(names.pop(active), ('original', 'another original'))
+            active = len(names) - 1
+        hit = dict(x=160, y=305, width=80, height=21, text='测试作者')
+        def results(query):
+            append('search')
+            return [hit], bar()
+        def candidate(*args, **kwargs):
+            append('candidate')
+        search.image = Mock(return_value=image)
+        search.tab_bar, search.select_tab, search.press = bar, select, close
+        search.results, search._point = results, candidate
+        with patch('wechat_account_search.lines', return_value=[]):
+            for error in (PlayerError('加载超时'), None):
+                search.wait = Mock(return_value=(image, [dict(hit, x=175, y=92)]), side_effect=error)
+                search.address = Mock(return_value=None)
+                with self.assertRaisesRegex(PlayerError, '未能核实其主页'):
+                    search.find_in_window('测试作者')
+                self.assertEqual((names, active), (['original', 'another original'], 0))
+
+            search.address.return_value = 'target@finder'
+            self.assertEqual(search.find_in_window('测试作者')[0]['id'], 'target@finder')
+            self.assertEqual((names, active), (['original', 'another original'], 0))
+
+    def test_ambiguous_or_preexisting_tab_cannot_be_closed(self):
+        search = AccountSearch('视频号', '搜索可见的作者名片')
+        search.press = Mock()
+        for positions, active in (([1, 2], 1), ([1, 2, 3], 1), ([1, 2, 3, 4], 3)):
+            bar = (positions, active, 800)
+            self.assertEqual(search.close_appended_tab(2, bar), bar)
+        search.press.assert_not_called()
+
+    def test_in_place_search_restores_the_original_using_back(self):
+        search = AccountSearch('视频号', '搜索可见的作者名片')
+        image = Image.new('RGB', (1158, 720), 'white')
+        original_bar = ([140, 250], 1, 800)
+        search.image = Mock(return_value=image)
+        search.tab_bar = Mock(return_value=original_bar)
+        search.results = Mock(return_value=([], original_bar))
+        search.address = Mock(return_value='original@finder')
+        search.press = Mock()
+        search._search_page = Mock(return_value=True)
+        with patch('wechat_account_search.lines', return_value=[dict(x=175, y=92)]), \
+                patch('wechat_account_search.time.sleep'):
+            self.assertEqual(search.find_in_window('测试作者'), [])
+            search.press.assert_called_once_with('alt+Left')
+            self.assertEqual(search.address.call_args_list, [call(bar=original_bar)] * 2)
+            search._search_page.return_value = False
+            search.press.reset_mock()
+            self.assertEqual(search.find_in_window('测试作者'), [])
+            search.press.assert_not_called()
+
     def test_search_discards_preclick_frames_and_falls_back_when_stream_ends(self):
         search = AccountSearch('视频号', '搜索可见的作者名片')
         stream = search.stream = Mock()

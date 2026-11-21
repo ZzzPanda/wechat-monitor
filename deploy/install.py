@@ -254,6 +254,8 @@ def start_vm():
     state = json.loads(output(lima, 'list', '--json', 'wx', env=env))
     if state['status'] != 'Running':
         run(lima, 'start', '--tty=false', 'wx', env=env)
+    with (SOURCE/'deploy/guest-swap.sh').open('rb') as script:
+        run(lima, 'shell', '--workdir=/', 'wx', '--', 'sudo', '-n', 'sh', '-s', stdin=script, env=env)
     for _ in range(30):
         if subprocess.run(DOCKER+['info'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
             return

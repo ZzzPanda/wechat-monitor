@@ -6,6 +6,7 @@ from contextlib import ExitStack
 import fcntl
 import io
 import json
+import logging
 from pathlib import Path
 import re
 import subprocess
@@ -53,6 +54,11 @@ def tabs(image):
     if len(active) != 1:
         raise AmbiguousActiveTab('无法确定微信当前打开的标签页。')
     return mids[:-1], active[0], mids[-1]
+
+
+def active_appended_tab(bar, previous_count):
+    positions, active, _ = bar
+    return len(positions) == previous_count + 1 and active == previous_count
 
 
 def nav_item(image, top, bottom, label):
@@ -233,15 +239,30 @@ class AccountSearch(Player):
         if index < len(mids) and index != active:
             self._point(mids[index], 25, click=True)
 
+    def close_appended_tab(self, previous_count, bar):
+        """Only close a single, active last tab added by the preceding action."""
+        if not active_appended_tab(bar, previous_count):
+            return bar
+        self.press('ctrl+w')
+        for _ in range(8):
+            bar = self.tab_bar()
+            if len(bar[0]) == previous_count:
+                return bar
+            if len(bar[0]) != previous_count + 1:
+                break
+            time.sleep(.12)
+        raise PlayerError('关闭临时标签后未能确认原有标签数。')
+
+    def _search_page(self, image):
+        rows = lines(image.crop((40, 72, min(875, image.width), 135)))
+        return any('搜索' in r['text'] and r['x'] > 600 for r in rows)
+
     def results(self, query):
         # Punctuation resembling a URL belongs in the search form, not in the address bar.
         natural_name = re.fullmatch(r'[\w -]+', query) and any('㐀' <= ch <= '鿿' for ch in query)
         term = query if natural_name else '微信视频号'
         self.address(term)
-        def search_page(im):
-            rows = lines(im.crop((40, 72, min(875, im.width), 135)))
-            return any('搜索' in r['text'] and r['x'] > 600 for r in rows)
-        self.wait(search_page, '微信搜一搜未打开，请检查登录和网络。')
+        self.wait(self._search_page, '微信搜一搜未打开，请检查登录和网络。')
         if term != query:
             self._point(250, 105, click=True)
             clipboard(query)
@@ -305,10 +326,12 @@ class AccountSearch(Player):
             owns_search = len(current) == len(old_tabs) + 1 and search_index == len(old_tabs)
             for hit in matches:
                 name = hit['text'].strip()
-                tab_count = len(current)
-                self._point(*center(hit), click=True)
-                identity = None
+                bar = self.tab_bar()
+                if bar[1] != search_index or len(bar[0]) != len(current):
+                    raise PlayerError('搜索标签已变化，无法继续打开候选主页。')
+                tab_count = len(bar[0])
                 try:
+                    self._point(*center(hit), click=True)
                     try:
                         profile_image, rows = self.wait(
                             lambda im: rows_if_profile(im, name), '微信未打开选中作者的主页。', 5)
@@ -324,11 +347,10 @@ class AccountSearch(Player):
                                            url=PROFILE+'?'+urlencode({'username': identity}),
                                            description=' · '.join(description)))
                 finally:
-                    bar = self.tab_bar()
-                    opened, active, _ = bar
-                    if identity and len(opened) == tab_count + 1 and active == tab_count:
-                        self.press('ctrl+w')
-                        bar = self.tab_bar()
+                    # The click can open a tab even when its profile/ID never loads.
+                    bar = self.close_appended_tab(tab_count, self.tab_bar())
+                    if len(bar[0]) != tab_count:
+                        raise PlayerError('候选主页打开后标签数异常，已停止搜索。')
                     current = bar[0]
                     self.select_tab(search_index, bar)
             if matches and not output:
@@ -336,16 +358,25 @@ class AccountSearch(Player):
             return output
         finally:
             bar = self.tab_bar()
-            current, active, _ = bar
-            # A fresh address-bar search opens a new last tab. Only close our own tab.
-            if search_index is None and len(current) == len(old_tabs)+1 and active == len(old_tabs):
-                search_index, owns_search = active, True
-            if search_index is not None and owns_search:
-                self.select_tab(search_index, bar)
-                self.press('ctrl+w')
-            self.select_tab(old_active)
-            if original_id and self.address() != original_id:
-                self.address(PROFILE+'?'+urlencode({'username': original_id}))
+            if search_index is None or owns_search:
+                bar = self.close_appended_tab(len(old_tabs), bar)
+            if len(bar[0]) == len(old_tabs):
+                self.select_tab(old_active, bar)
+                # Submitting the old URL can itself open a new tab. Only undo
+                # in-place search navigation within the original tab's history.
+                if original_id and not owns_search and search_index == old_active:
+                    bar = self.tab_bar()
+                    if bar[1] == old_active and self._search_page(self.image()):
+                        self.press('alt+Left')
+                        for _ in range(4):
+                            time.sleep(.2)
+                            bar = self.tab_bar()
+                            if len(bar[0]) != len(old_tabs) or bar[1] != old_active:
+                                break
+                            if self.address(bar=bar) == original_id:
+                                break
+                        else:
+                            logging.warning('搜索结束后未能核实原页，已保留原有标签。')
 
 
 def rows_if_profile(image, name):

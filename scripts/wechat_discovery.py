@@ -2,6 +2,7 @@
 import hashlib
 import logging
 import re
+import subprocess
 import time
 from dataclasses import dataclass
 from itertools import chain, count
@@ -10,7 +11,9 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import numpy as np
 from PIL import Image
 
-from wechat_account_search import AccountSearch, PROFILE, open_from_main, profile_name, search_accounts, windows
+from wechat_account_search import (
+    AccountSearch, PROFILE, active_appended_tab, open_from_main, profile_name, search_accounts, windows,
+)
 from wechat_paths import check_drive
 from wechat_player import PlayerError, author_matches, center, guest, lines, norm, runs
 
@@ -139,17 +142,68 @@ class ProfileDiscovery(AccountSearch):
     def __init__(self, name):
         super().__init__(name, '读取主页上的公开作品')
         self.stream = None
+        self.opened_profile_tabs = []
+        self.profile_id = self.profile_tab = None
+
+    def _navigate(self, url, message):
+        before = self.tab_bar()
+        page_ready = False
+        try:
+            self.address(url, bar=before)
+            self.wait(self._header_name, message, 12)
+            page_ready = True
+        finally:
+            # Remember the change immediately, while this navigation owns the player.
+            try:
+                after = self.tab_bar()
+            except (PlayerError, OSError, ValueError, subprocess.SubprocessError):
+                if page_ready:
+                    raise
+                # A crashed renderer can hide the tab strip. Keep the original
+                # navigation failure so open_profile can identify and reload it.
+                logging.warning('未能确认本次导航新建的标签，已跳过该标签的回收。')
+            else:
+                if active_appended_tab(after, len(before[0])):
+                    self.opened_profile_tabs.append((len(before[0]), before[1]))
+
+    def close_profile_tabs(self):
+        try:
+            while self.opened_profile_tabs:
+                index, prior = self.opened_profile_tabs.pop()
+                bar = self.tab_bar()
+                if not active_appended_tab(bar, index):
+                    break
+                if index == self.profile_tab and self.profile_id and self.address(bar=bar) != self.profile_id:
+                    break
+                bar = self.close_appended_tab(index, self.tab_bar())
+                if len(bar[0]) != index:
+                    break
+                self.select_tab(prior, bar)
+        except (PlayerError, OSError, ValueError, subprocess.SubprocessError):
+            logging.warning('未能确认临时主页标签的状态，已停止关闭标签。')
 
     def open_profile(self, url, identity):
         ids = windows('^WeChatAppEx$') or open_from_main()
         if len(ids) != 1:
             raise PlayerError('请在微信桌面保留一个视频号窗口。')
         guest('xdotool', 'windowactivate', '--sync', ids[0])
-        crash = renderer_crash(self.image())
+        frame = self.image()
+        crash = renderer_crash(frame)
+        # Replaying a changed history checkpoint can start on the same profile
+        # several screens down. Return to the top of the verified tab in place.
+        if crash is None and self.profile_id and self.tab_bar(frame)[1] == self.profile_tab:
+            if self.address() == self.profile_id and (not identity or self.profile_id == identity):
+                self.press('Home')
+                try:
+                    self.wait(self._header_name, '未能回到作者主页顶部。', 4)
+                except PlayerError:
+                    pass
+                else:
+                    time.sleep(.35)
+                    return
         if crash is None:
-            self.address(url)
             try:
-                self.wait(self._header_name, '微信未打开指定作者的主页。', 12)
+                self._navigate(url, '微信未打开指定作者的主页。')
             except PlayerError:
                 crash = renderer_crash(self.image())
                 if crash is None:
@@ -162,8 +216,7 @@ class ProfileDiscovery(AccountSearch):
             logging.warning('%s，正在重新加载以打开%s的主页。', problem, self.author)
             self._point(*center(button), click=True)
             self.wait(lambda im: renderer_crash(im) is None, f'{problem}，点击重新加载后仍显示崩溃页。', 8)
-            self.address(url)
-            self.wait(self._header_name, f'{problem}，重新加载后未能核实指定作者的主页。', 12)
+            self._navigate(url, f'{problem}，重新加载后未能核实指定作者的主页。')
         actual = self.address()
         if not actual or (identity and actual != identity):
             raise PlayerError('打开的微信主页与所选视频号标识不一致。')
@@ -187,11 +240,10 @@ class ProfileDiscovery(AccountSearch):
         return self.copy_visible_share_url(image, author)
 
     def return_to_grid(self, previous_count):
-        tabs, active, _ = self.tab_bar()
-        if active != self.profile_tab:
-            if len(tabs) == previous_count+1 and active == len(tabs)-1:
-                self.press('ctrl+w')
-            self.select_tab(self.profile_tab)
+        bar = self.close_appended_tab(previous_count, self.tab_bar())
+        if len(bar[0]) != previous_count:
+            raise PlayerError('作品标签数异常，未能安全返回作者主页。')
+        self.select_tab(self.profile_tab, bar)
         if self.address() != self.profile_id:
             raise PlayerError('作品关闭后未能返回该作者主页，已停止以避免收录其他账号。')
 
@@ -265,7 +317,14 @@ def crawl_profile(entry, *, mode, known, on_work, should_stop, checkpoint=None, 
         return dict(complete=False, reason='已停止')
     profile = ProfileDiscovery(entry['name'])
     url, identity = resolved_profile(entry)
-    profile.open_profile(url, identity)
+    try:
+        profile.open_profile(url, identity)
+        return _crawl_grid(profile, url, identity, mode, known, on_work, should_stop, checkpoint, on_boundary)
+    finally:
+        profile.close_profile_tabs()
+
+
+def _crawl_grid(profile, url, identity, mode, known, on_work, should_stop, checkpoint, on_boundary):
     processed = failures = known_run = offset = 0
     last_card_error = ''
     seen = set()
@@ -330,7 +389,7 @@ def crawl_profile(entry, *, mode, known, on_work, should_stop, checkpoint=None, 
                     failures += 1
                     last_card_error = str(exc)[:200]
                     logging.warning('%s 的作品卡 (%d, %d) 未能核验：%s',
-                                    entry['name'], card.x, card.y, last_card_error)
+                                    profile.author, card.x, card.y, last_card_error)
                     continue
                 if work_url in seen:
                     continue

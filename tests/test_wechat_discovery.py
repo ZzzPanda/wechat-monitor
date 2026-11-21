@@ -46,7 +46,7 @@ class ProfileRecoveryTests(unittest.TestCase):
         with patch.object(discovery, 'lines', return_value=self.rows), self.assertLogs(level='WARNING'):
             self.page.open_profile(self.url, 'target@finder')
         self.page._point.assert_called_once_with(897, 469, click=True)
-        self.assertEqual(self.page.address.call_args_list, [call(self.url), call()])
+        self.assertEqual(self.page.address.call_args_list, [call(self.url, bar=self.page.tab_bar.return_value), call()])
         self.assertEqual(self.page.profile_id, 'target@finder')
 
     def test_crash_after_navigation_retries_original_url_and_rejects_wrong_account(self):
@@ -57,7 +57,8 @@ class ProfileRecoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(discovery.PlayerError, '标识不一致'):
                 self.page.open_profile(self.url, 'target@finder')
         self.page._point.assert_called_once()
-        self.assertEqual(self.page.address.call_args_list, [call(self.url), call(self.url), call()])
+        navigate = call(self.url, bar=self.page.tab_bar.return_value)
+        self.assertEqual(self.page.address.call_args_list, [navigate, navigate, call()])
         self.page.press.assert_not_called()
 
     def test_persistent_crash_reports_error_code_and_stops_after_one_reload(self):
@@ -72,6 +73,17 @@ class ProfileRecoveryTests(unittest.TestCase):
         self.page._point.assert_called_once()
         self.page.address.assert_not_called()
 
+    def test_crash_recovery_preserves_navigation_error_if_the_tab_strip_is_unreadable(self):
+        bar = self.page.tab_bar.return_value
+        self.page.image.return_value = self.frame
+        self.page.wait.side_effect = [discovery.PlayerError('原始导航超时'), True, True]
+        self.page.tab_bar.side_effect = [bar, OSError('temporarily unreadable'), bar, bar, bar]
+        with patch.object(discovery, 'lines', side_effect=[[], self.rows]), self.assertLogs(level='WARNING'):
+            self.page.open_profile(self.url, 'target@finder')
+        self.page._point.assert_called_once()
+        self.assertEqual(self.page.profile_id, 'target@finder')
+        self.assertFalse(self.page.opened_profile_tabs)
+
     def test_other_load_failure_is_not_retried(self):
         self.page.image.return_value = self.frame
         self.page.wait.side_effect = discovery.PlayerError('微信未打开指定作者的主页。')
@@ -79,7 +91,46 @@ class ProfileRecoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(discovery.PlayerError, '未打开指定作者'):
                 self.page.open_profile(self.url, 'target@finder')
         self.page._point.assert_not_called()
-        self.page.address.assert_called_once_with(self.url)
+        self.page.address.assert_called_once_with(self.url, bar=self.page.tab_bar.return_value)
+
+    def test_owned_navigation_tabs_are_released_in_reverse_and_originals_preserved(self):
+        old = ([160, 320], 0, 680)
+        opened = ([160, 300, 440], 2, 680)
+        nested = ([160, 260, 360, 460], 3, 680)
+        self.page.tab_bar.side_effect = [old, opened, opened, nested]
+        self.page._navigate(self.url, 'timeout')
+        self.page.wait.side_effect = discovery.PlayerError('second navigation failed')
+        with self.assertRaisesRegex(discovery.PlayerError, 'second navigation failed'):
+            self.page._navigate(self.url, 'timeout')
+        self.page.tab_bar.side_effect = [nested, nested, opened, opened, opened, old]
+        self.page.close_profile_tabs()
+        self.assertEqual(self.page.press.call_args_list, [call('ctrl+w'), call('ctrl+w')])
+        self.assertEqual(self.page.opened_profile_tabs, [])
+
+    def test_cleanup_preserves_existing_or_changed_tabs(self):
+        old = ([160, 320], 1, 680)
+        other = ([160, 300, 440], 0, 680)
+        target = ([160, 300, 440], 2, 680)
+        self.page.tab_bar.side_effect = [old, old]
+        self.page._navigate(self.url, 'timeout')
+        self.page.close_profile_tabs()
+        self.page.press.assert_not_called()
+        for layout in (other, target):
+            self.page.tab_bar.side_effect = [old, target, layout]
+            self.page._navigate(self.url, 'timeout')
+            self.page.profile_id, self.page.profile_tab = 'target@finder', 2
+            self.page.address.return_value = 'different@finder'
+            self.page.close_profile_tabs()
+            self.page.press.assert_not_called()
+
+    def test_reentering_the_same_verified_profile_rewinds_in_place(self):
+        self.page.profile_id, self.page.profile_tab = 'target@finder', 0
+        self.page.image.return_value = self.frame
+        with patch.object(discovery, 'renderer_crash', return_value=None):
+            self.page.open_profile(self.url, 'target@finder')
+        self.page.press.assert_called_once_with('Home')
+        self.page.address.assert_called_once_with()
+        self.assertFalse(self.page.opened_profile_tabs)
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -128,6 +179,7 @@ class DiscoveryTests(unittest.TestCase):
                                              on_work=delivered.append, should_stop=lambda:False, checkpoint=checkpoint,
                                              on_boundary=boundary if on_boundary else None)
         self.assertEqual(desktop.open_work.call_count, desktop.return_to_grid.call_count)
+        desktop.close_profile_tabs.assert_called_once_with()
         self.assertFalse(in_player)
         return delivered, result
 
