@@ -64,7 +64,7 @@ class HostToolDownloadTests(unittest.TestCase):
 @unittest.skipUnless(sys.platform == 'darwin' and platform.machine() == 'arm64' and
                      int(platform.mac_ver()[0].split('.')[0]) >= 15, 'supported macOS Apple Silicon bootstrap')
 class ShellBootstrapTests(unittest.TestCase):
-    def test_bootstrap_resumes_partial_transfer_and_preserves_cli_arguments(self):
+    def test_bootstrap_retries_tls_resumes_transfer_and_preserves_cli_arguments(self):
         with tempfile.TemporaryDirectory() as folder:
             work = Path(folder)
             repo = work / 'source repo'
@@ -86,6 +86,9 @@ class ShellBootstrapTests(unittest.TestCase):
             response.write_text(
                 'from pathlib import Path\nimport sys\n'
                 'assert sys.argv[1] == "--disable"\n'
+                'assert sys.argv[-1] == "https://primary.example/pinned"\n'
+                'attempt = Path(__file__).with_name("tls-retry")\n'
+                'if not attempt.exists():\n    attempt.touch()\n    sys.exit(35)\n'
                 'file = Path(sys.argv[sys.argv.index("-o")+1])\n'
                 'data = Path(__file__).with_name("pinned.tgz").read_bytes()\n'
                 'if not file.exists():\n'

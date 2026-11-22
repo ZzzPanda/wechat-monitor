@@ -77,6 +77,27 @@ class OciCacheTests(unittest.TestCase):
             cache.download_blob(fallback, blobs, scratch, self.desc, pool)
             self.assertEqual([r for _,r in fallback.requests], ['bytes=0-2',None])
 
+    def test_layer_retries_without_redownloading_completed_offsets(self):
+        config = json.dumps({'os': 'linux', 'architecture': 'arm64'}).encode()
+        manifest = json.dumps({'mediaType': 'application/vnd.oci.image.manifest.v1+json',
+                               'config': {'size': len(config), 'digest': checksum(config)},
+                               'layers': [self.desc]}).encode()
+        registry = TestRegistry({checksum(b): b for b in (config, manifest, self.content)})
+        fail_offset = 6
+        calls = []
+        fetch = cache.fetch_part
+        def simulate_outage(registry, key, total, offset, length, dest, ranged):
+            if key == self.desc['digest']:
+                calls.append(offset)
+                if offset == fail_offset and calls.count(fail_offset) == 1:
+                    raise cache.URLError('connection lost after other ranges completed')
+            return fetch(registry, key, total, offset, length, dest, ranged)
+        with patch.object(cache, 'Registry', return_value=registry), patch.object(cache, 'CHUNK', 3), \
+             patch.object(cache, 'WORKERS', 1), patch.object(cache.time, 'sleep'), \
+             patch.object(cache, 'fetch_part', side_effect=simulate_outage):
+            cache.prepare('docker.io/library/python@' + checksum(manifest), self.root/'layout')
+        self.assertEqual(calls, [0, 3, 6, 6])
+
     def test_arm64_index_and_offline_rerun(self):
         config = json.dumps({'os':'linux','architecture':'arm64'}).encode()
         manifest = json.dumps({'mediaType':'application/vnd.oci.image.manifest.v1+json','schemaVersion':2,

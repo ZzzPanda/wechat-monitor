@@ -15,7 +15,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from host_tools import download_release
+from host_tools import DownloadError, download_release
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from wechat_paths import check_drive, child_on_drive, lima_home, resolve_root
@@ -114,22 +114,34 @@ def install_lima(runtime, cache):
         return
     if os.path.lexists(command):
         raise ValueError(f'现有 limactl 无法执行：{command}')
-    package = runtime / ('lima-2.3.0-sequoia' if sequoia else 'lima-2.3.0')
-    if package.is_symlink():
-        raise ValueError(f'软件包目录不可为符号链接：{package}')
-    if not package.exists():
-        archive = artifact(cache, LIMA_SEQUOIA if sequoia else LIMA_TAR)
-        with tempfile.TemporaryDirectory(dir=runtime) as work:
-            tree = Path(work) / 'package'
-            tree.mkdir()
-            unpack_lima(archive, tree, bottle=sequoia)
-            if digest(tree / 'bin/limactl') != expected:
-                raise ValueError('limactl 解包校验失败')
-            os.rename(tree, package)
-    binary = package / 'bin/limactl'
-    if not binary.is_file() or not binary.resolve().is_relative_to(package) or digest(binary) != expected:
-        raise ValueError(f'已展开的 Lima 工具未通过校验：{binary}')
-    command.symlink_to(Path('..') / package.name / 'bin/limactl')
+    candidates = [(LIMA_SEQUOIA, runtime / 'lima-2.3.0-sequoia', SEQUOIA_LIMACTL_SHA)]
+    if not sequoia:
+        candidates.insert(0, (LIMA_TAR, runtime / 'lima-2.3.0', LIMACTL_SHA))
+    # An interrupted install may already have unpacked a verified package of either build.
+    staged = [candidate for candidate in candidates if os.path.lexists(candidate[1])]
+    for source, package, expected in staged or candidates:
+        if package.is_symlink():
+            raise ValueError(f'软件包目录不可为符号链接：{package}')
+        if not package.exists():
+            try:
+                archive = artifact(cache, source)
+            except DownloadError:
+                if source != LIMA_TAR:
+                    raise
+                print('GitHub 发行包暂时不可用，改用相同版本的 Homebrew ARM64 发行包。', flush=True)
+                continue
+            with tempfile.TemporaryDirectory(dir=runtime) as work:
+                tree = Path(work) / 'package'
+                tree.mkdir()
+                unpack_lima(archive, tree, bottle=source == LIMA_SEQUOIA)
+                if digest(tree / 'bin/limactl') != expected:
+                    raise ValueError('limactl 解包校验失败')
+                os.rename(tree, package)
+        binary = package / 'bin/limactl'
+        if not binary.is_file() or not binary.resolve().is_relative_to(package) or digest(binary) != expected:
+            raise ValueError(f'已展开的 Lima 工具未通过校验：{binary}')
+        command.symlink_to(Path('..') / package.name / 'bin/limactl')
+        return
 
 
 def install_guest(cache):

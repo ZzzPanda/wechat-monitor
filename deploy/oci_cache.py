@@ -88,14 +88,14 @@ class Registry:
                         self.token = None
 
 
-def retry(function):
-    for attempt in range(4):
+def retry(function, *, attempts=4):
+    for attempt in range(attempts):
         try:
             return function()
         except (HTTPError, URLError, HTTPException, OSError) as err:
             if isinstance(err, HTTPError):
                 err.close()
-            if attempt == 3 or isinstance(err, HTTPError) and err.code in (400, 401, 404):
+            if attempt + 1 == attempts or isinstance(err, HTTPError) and err.code in (400, 401, 404):
                 raise
             time.sleep(2 ** attempt)
 
@@ -228,7 +228,9 @@ def prepare(reference, target):
         config = doc['config']
         with ThreadPoolExecutor(max_workers=WORKERS) as workers:
             for desc in [config, *doc['layers']]:
-                download_blob(registry, blobs, scratch, desc, workers)
+                # A connection outage may exhaust one parallel range while others have succeeded.
+                # Resume the layer from its sealed ranges before returning an error to the installer.
+                retry(lambda: download_blob(registry, blobs, scratch, desc, workers), attempts=3)
         architecture = json.loads((blobs/digest_name(config['digest'])).read_bytes())
         if (architecture.get('os'), architecture.get('architecture')) != ('linux', 'arm64'):
             raise ValueError('基础镜像不是 Linux ARM64')

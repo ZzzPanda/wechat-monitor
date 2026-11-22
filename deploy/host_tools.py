@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = Path(__file__).resolve().parent
 LOCK = json.loads((HERE / 'host-tools.lock.json').read_text())
@@ -26,6 +27,10 @@ def valid(path, spec):
         return digest.hexdigest() == spec['sha256']
 
 
+class DownloadError(RuntimeError):
+    pass
+
+
 def download_release(spec, urls, target, pending):
     if valid(target, spec):
         return target
@@ -36,7 +41,7 @@ def download_release(spec, urls, target, pending):
         pending.unlink()
     print(f"正在下载 {spec['name']}（{spec['size'] / 1e6:.1f} MB）…", flush=True)
     for url in urls:
-        for _ in range(3):
+        for attempt in range(3):
             resume = ['--continue-at', '-'] if pending.is_file() and pending.stat().st_size else []
             # Disable user curlrc options. curl drops Authorization on cross-host redirects by default.
             auth = ['-H', 'Authorization: Bearer QQ=='] if url.startswith('https://ghcr.io/v2/homebrew/') else []
@@ -54,9 +59,12 @@ def download_release(spec, urls, target, pending):
                 break  # Complete response with wrong digest: try the alternate source.
             if resume and result.returncode in (22, 33, 36):
                 pending.unlink(missing_ok=True)  # Server rejected the range; restart from byte zero.
-            elif result.returncode not in (18, 28, 56):
+            elif result.returncode in (6, 7, 18, 28, 35, 52, 55, 56, 92):
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+            else:
                 break
-    raise RuntimeError(f"{spec['name']} 下载或 SHA-256 校验失败，已验证的其他组件可在重试时复用。")
+    raise DownloadError(f"{spec['name']} 下载或 SHA-256 校验失败，已验证的其他组件可在重试时复用。")
 
 
 def fetch(name, cache):

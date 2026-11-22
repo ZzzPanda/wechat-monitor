@@ -49,6 +49,7 @@ if [ ! -x "$python" ]; then
             fi
             case $failure in
                 18|28|56) continue ;;
+                6|7|35|52|55|92) [ "$attempt" -ge 3 ] || /bin/sleep "$attempt" ;;
                 22|33|36) [ "$resumed" = yes ] || return 1; /bin/rm -f "$pending" ;;
                 *) return 1 ;;
             esac

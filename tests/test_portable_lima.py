@@ -61,6 +61,30 @@ class PortableLimaTests(unittest.TestCase):
                     bootstrap.artifact(Path(folder), bootstrap.LIMA_SEQUOIA)
                 curl.assert_called_once()
 
+    def test_newer_macos_can_fall_back_to_the_verified_sequoia_bottle(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            runtime = root / 'runtime'
+            runtime.mkdir()
+            bottle = root / 'lima.tgz'
+            binary = b'portable'
+            with tarfile.open(bottle, 'w:gz') as tar:
+                item = tarfile.TarInfo('lima/2.3.0/bin/limactl')
+                item.size = len(binary)
+                item.mode = 0o755
+                tar.addfile(item, io.BytesIO(binary))
+            with patch.object(bootstrap.platform, 'mac_ver', return_value=('26.2', (), 'arm64')), \
+                 patch.object(bootstrap, 'SEQUOIA_LIMACTL_SHA', hashlib.sha256(binary).hexdigest()), \
+                 patch.object(bootstrap, 'artifact', side_effect=[bootstrap.DownloadError('TLS'), bottle]) as fetch:
+                bootstrap.install_lima(runtime, root)
+                self.assertEqual([args.args[1] for args in fetch.call_args_list],
+                                 [bootstrap.LIMA_TAR, bootstrap.LIMA_SEQUOIA])
+                self.assertEqual((runtime / 'bin/limactl').resolve(), runtime / 'lima-2.3.0-sequoia/bin/limactl')
+                self.assertFalse((runtime / 'lima-2.3.0').exists())
+                (runtime / 'bin/limactl').unlink()
+                bootstrap.install_lima(runtime, root)
+                self.assertEqual(fetch.call_count, 2)
+
     def test_sequoia_install_survives_macos_upgrade_and_rejects_changed_binary(self):
         with TemporaryDirectory() as folder:
             root = Path(folder).resolve()
