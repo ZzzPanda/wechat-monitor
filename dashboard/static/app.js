@@ -6,7 +6,7 @@ const collator = new Intl.Collator("zh-CN", { numeric: true });
 const player = byId("player");
 const playerDialog = byId("player-dialog");
 const analysisHash = (key) => "#analysis/" + key;
-let routedVideo = null;
+let routedAnalysis = null;
 let pendingLoad = 0;
 let noticeTimer;
 let addingAuthor = false;
@@ -199,29 +199,35 @@ function openVideo(video, analysis = false) {
   else if (url) player.play().catch(() => { /* Native controls allow manual playback. */ });
 }
 
-function openRoutedAnalysis() {
-  const key = /^#analysis\/([0-9a-f]{64})$/.exec(window.location.hash)?.[1];
+function openRoutedAnalysis(reloadIfMissing = false) {
+  const hash = window.location.hash;
+  const key = /^#(?:analysis|video-analyses)\/([0-9a-f]{64})$/.exec(hash)?.[1];
   if (!key) {
-    if (routedVideo) {
-      routedVideo = null;
+    if (routedAnalysis) {
+      routedAnalysis = null;
       playerDialog.close();
     }
     return;
   }
-  if (!state.loaded || (routedVideo === key && playerDialog.open)) return;
+  if (!state.loaded || (routedAnalysis === hash && playerDialog.open)) return;
   const video = state.videos.find(item => item.id === key);
   if (!video) {
-    if (routedVideo) playerDialog.close();
-    removeAnalysisHash();
+    if (reloadIfMissing) {
+      loadDashboard();
+      return;
+    }
+    if (routedAnalysis) playerDialog.close();
+    removeAnalysisHash(hash);
     notice("资料库中找不到这条视频。");
     return;
   }
-  routedVideo = key;
+  routedAnalysis = hash;
   openVideo(video, true);
 }
 
-function removeAnalysisHash() {
-  history.replaceState(history.state, "", window.location.pathname + window.location.search);
+function removeAnalysisHash(hash) {
+  const destination = hash.startsWith("#video-analyses/") ? "#video-analyses" : window.location.pathname + window.location.search;
+  history.replaceState(history.state, "", destination);
 }
 
 function videoCard(video) {
@@ -367,8 +373,14 @@ byId("player-view-analysis").addEventListener("click", () => showPlayerView("ana
 player.addEventListener("error", () => { if (playerDialog.open) byId("player-error").hidden = false; });
 playerDialog.addEventListener("close", () => {
   if (playerDialog.open) return;
-  if (routedVideo && window.location.hash === analysisHash(routedVideo)) removeAnalysisHash();
-  routedVideo = null;
+  if (routedAnalysis && window.location.hash === routedAnalysis) {
+    removeAnalysisHash(routedAnalysis);
+    if (activeView === "video-analyses") {
+      const link = byId("video-analyses").querySelector('a[href="' + routedAnalysis + '"]');
+      (link || viewPanel(activeView)).focus();
+    }
+  }
+  routedAnalysis = null;
   delete playerDialog.dataset.videoKey;
   player.pause();
   player.removeAttribute("src");
@@ -1251,8 +1263,9 @@ logForm.addEventListener("change", event => {
 
 const viewTitles = {
   main: "视频资料库", public: "公众号文章", settings: "设置", logs: "日志",
-  "video-accounts": "监控视频号", "official-accounts": "监控公众号"
+  "video-accounts": "监控视频号", "official-accounts": "监控公众号", "video-analyses": "视频解析"
 };
+const sidebarViews = ["public", "settings", "logs", "video-accounts", "official-accounts", "video-analyses"];
 
 function viewPanel(view) {
   return byId(view === "video-accounts" || view === "official-accounts" ? "account-directory" : view);
@@ -1295,8 +1308,8 @@ function showCurrentView(focus = false) {
     }
   }
   setNavOpen(false);
-  for (const name of ["public", "settings", "logs", "video-accounts", "official-accounts"]) {
-    setCurrentNavItem(byId("open-" + name), hash === "#" + name);
+  for (const name of sidebarViews) {
+    setCurrentNavItem(byId("open-" + name), name === "video-analyses" ? view === name : hash === "#" + name);
   }
   if (state.loaded) {
     renderNav();
@@ -1308,14 +1321,14 @@ function showCurrentView(focus = false) {
     crawlPanel.open = true;
     if (focus) crawlPanel.querySelector("summary").focus();
   }
-  openRoutedAnalysis();
+  openRoutedAnalysis(focus);
 }
 
 document.querySelector(".skip-link").addEventListener("click", event => {
   event.preventDefault();
   focusView(activeView);
 });
-for (const view of ["public", "settings", "logs", "video-accounts", "official-accounts"]) byId("open-" + view).addEventListener("click", () => {
+for (const view of sidebarViews) byId("open-" + view).addEventListener("click", () => {
   if (activeView === view) {
     setNavOpen(false);
     focusView(view);

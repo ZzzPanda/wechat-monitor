@@ -7,6 +7,7 @@ from video_analysis_queue import LeaseError, public_job
 
 
 VIDEO_PATH = re.compile(r'/api/videos/([0-9a-f]{64})/analysis')
+COLLECTION_PATH = '/api/video-analyses'
 WORKER_PATH = '/api/video-analysis-worker'
 WORKER_KEY = 'video-analysis-worker.key'
 JOB_FIELD = {'job_id', 'lease_token'}
@@ -48,10 +49,23 @@ def worker_call(queue, data):
     return {'ok': True}
 
 
-def analysis_reply(handler, work_key):
+def analysis_summaries(queue, library):
+    summaries = queue.list_summaries()
+    if not summaries:
+        return []
+    recordings = {(row['work_key'], row['sha256']): row for row in library.recordings(include_digest=True)}
+    jobs = []
+    for summary in summaries:
+        row = recordings.get((summary['work_key'], summary.pop('sha256')))
+        if row is not None and library.available_for_analysis(row):
+            jobs.append(dict(summary, **library.recording_display(row)))
+    return jobs
+
+
+def analysis_reply(handler, path, work_key):
     server = handler.server
     queue = server.video_analysis
-    if work_key is None:
+    if path == WORKER_PATH:
         if handler.command != 'POST':
             return 405, {'error': '视频分析进程仅可提交 POST 请求。'}
         if not server.worker_authorized(handler.headers.get('X-Video-Analysis-Worker', ''), WORKER_KEY):
@@ -64,6 +78,11 @@ def analysis_reply(handler, work_key):
         return 200, reply
 
     method = handler.command
+    worker_online = time.monotonic() - server.last_video_analysis_tick < WORKER_TIMEOUT
+    if path == COLLECTION_PATH:
+        if method not in ('GET', 'HEAD'):
+            return 405, {'error': '视频分析列表仅支持查询。'}
+        return 200, {'jobs': analysis_summaries(queue, server.library), 'worker_online': worker_online}
     if method not in ('GET', 'HEAD', 'POST'):
         return 405, {'error': '视频分析仅支持查询与提交。'}
     if method == 'POST':
@@ -79,13 +98,12 @@ def analysis_reply(handler, work_key):
         code, job = 202, queue.enqueue(recording)
     else:
         code, job = 200, queue.get(work_key, recording['sha256'])
-    return code, {'job': public_job(job),
-                  'worker_online': time.monotonic() - server.last_video_analysis_tick < WORKER_TIMEOUT}
+    return code, {'job': public_job(job), 'worker_online': worker_online}
 
 
-def handle(handler, work_key):
+def handle(handler, path, work_key):
     try:
-        reply = analysis_reply(handler, work_key)
+        reply = analysis_reply(handler, path, work_key)
     except ValueError as err:
         reply = 400, {'error': str(err)}
     except (OSError, sqlite3.Error) as err:

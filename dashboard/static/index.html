@@ -11,6 +11,7 @@
   <script src="/app.js" defer></script>
   <script src="/public.js" defer></script>
   <script src="/video_analysis.js" defer></script>
+  <script src="/video_analysis_list.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">跳至主要内容</a>
@@ -25,6 +26,9 @@
         <a href="#main" id="all-videos" class="nav-item current" aria-current="page">
           <span class="grid-icon" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
           <span class="nav-name">全部视频</span><span class="nav-count" id="all-count"></span>
+        </a>
+        <a href="#video-analyses" id="open-video-analyses" class="nav-item">
+          <span class="analysis-icon" aria-hidden="true"></span><span class="nav-name">视频解析</span>
         </a>
         <a href="#public" id="open-public" class="nav-item">
           <span class="article-icon" aria-hidden="true"></span><span class="nav-name">全部文章</span><span class="nav-count" id="public-all-count"></span>
@@ -123,6 +127,40 @@
           <button id="clear-search" type="button" class="quiet-button" hidden>清除搜索</button>
         </div>
       </section>
+    </main>
+
+    <main id="video-analyses" class="main" tabindex="-1" aria-labelledby="analysis-list-title" hidden>
+      <header class="page-header">
+        <div>
+          <h1 id="analysis-list-title">视频解析</h1>
+          <div class="page-metadata"><p class="summary" id="analysis-list-summary" role="status">正在读取解析任务…</p></div>
+        </div>
+      </header>
+      <div class="toolbar">
+        <label class="search"><span class="search-icon" aria-hidden="true"></span>
+          <input id="analysis-list-query" type="search" maxlength="256" placeholder="搜索视频或作者" aria-label="搜索解析任务" autocomplete="off">
+        </label>
+        <div class="toolbar-actions">
+          <label class="sort">
+            <select id="analysis-list-status" aria-label="解析状态筛选">
+              <option value="">全部状态</option>
+              <option value="queued">排队中</option>
+              <option value="running">正在解析</option>
+              <option value="succeeded">已完成</option>
+              <option value="failed">失败</option>
+            </select>
+            <span class="chevron" aria-hidden="true"></span>
+          </label>
+          <button id="analysis-list-refresh" class="icon-button" type="button" title="刷新解析任务" aria-label="刷新解析任务"><span class="refresh-icon" aria-hidden="true">↻</span></button>
+        </div>
+      </div>
+      <p id="analysis-list-error" class="inline-error" role="alert" hidden></p>
+      <ul id="analysis-list-jobs" class="analysis-jobs" aria-label="解析任务" hidden></ul>
+      <div id="analysis-list-empty" class="empty-state" hidden>
+        <h2 id="analysis-list-empty-title"></h2>
+        <a href="#main" id="analysis-list-open-library" class="quiet-button analysis-list-library" hidden>到视频库选择视频</a>
+        <button id="analysis-list-clear" type="button" class="quiet-button" hidden>清除筛选</button>
+      </div>
     </main>
 
     <main id="public" class="main" tabindex="-1" hidden>

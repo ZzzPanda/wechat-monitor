@@ -49,6 +49,11 @@ a.nav-item { text-decoration: none; }
 .avatar { display: inline-grid; place-items: center; flex: none; width: 25px; height: 25px; border-radius: 7px; background: #eaf0e6; color: #546751; font-size: 12px; font-weight: 600; }
 .grid-icon { width: 25px; height: 17px; flex: none; display: grid; grid-template-columns: repeat(2, 7px); grid-template-rows: repeat(2, 7px); gap: 3px; justify-content: center; }
 .grid-icon i { border: 1.5px solid currentColor; border-radius: 2px; }
+.analysis-icon { display: grid; place-content: center; width: 25px; height: 25px; flex: none; }
+.analysis-icon::before { content: ""; width: 17px; height: 15px; border: 1.5px solid currentColor; border-radius: 3px;
+  background: linear-gradient(currentColor, currentColor) 3px 7px / 1.5px 3px no-repeat,
+              linear-gradient(currentColor, currentColor) 6px 5px / 1.5px 5px no-repeat,
+              linear-gradient(currentColor, currentColor) 9px 3px / 1.5px 7px no-repeat; }
 .settings-icon { display: grid; justify-items: center; align-content: center; gap: 4px; width: 25px; height: 25px; flex: none; }
 .settings-icon i { position: relative; width: 16px; height: 1.5px; background: currentColor; border-radius: 2px; }
 .settings-icon i::before { content: ""; position: absolute; top: -2px; left: 4px; width: 2px; height: 5.5px; border-radius: 2px; background: currentColor; }
@@ -274,6 +279,33 @@ button.video-analysis-time:hover { background: var(--pale-green); }
 .video-analysis-windows > summary { cursor: pointer; width: fit-content; font-weight: 600; }
 .video-analysis-windows > article { display: grid; gap: 6px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--rule); }
 .video-analysis-windows > article > .video-analysis-time { justify-self: start; }
+#analysis-list-status { padding-left: 12px; }
+.analysis-list-library { text-decoration: none; }
+.analysis-jobs { list-style: none; margin: 0; padding: 0; border: 1px solid var(--rule); border-radius: 10px; background: #fff; }
+.analysis-jobs > li + li { border-top: 1px solid var(--rule); }
+.analysis-job-link { display: grid; grid-template-columns: 62px minmax(0,1fr) minmax(130px,auto) auto; align-items: center; gap: 13px; padding: 13px 16px; color: var(--ink); text-decoration: none; }
+.analysis-jobs > li:first-child .analysis-job-link { border-radius: 9px 9px 0 0; }
+.analysis-jobs > li:last-child .analysis-job-link { border-radius: 0 0 9px 9px; }
+.analysis-jobs > li:only-child .analysis-job-link { border-radius: 9px; }
+.analysis-job-link:hover, .analysis-job-link:focus-visible { background: #f0f5f0; }
+.analysis-job-thumbnail { position: relative; display: grid; place-items: center; width: 100%; aspect-ratio: 4 / 3; overflow: hidden; border-radius: 6px; color: #536e5b; background: #eaf0e8; }
+.analysis-job-thumbnail > img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.analysis-job-name, .analysis-job-state { display: grid; gap: 4px; }
+.analysis-job-name strong { font-size: 15px; line-height: 1.4; overflow-wrap: anywhere; }
+.analysis-job-meta, .analysis-job-info { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.analysis-job-info { font-variant-numeric: tabular-nums; }
+.analysis-job-state progress { width: 122px; max-width: 100%; height: 6px; accent-color: var(--green); }
+.analysis-job-status { width: fit-content; padding: 2px 7px; border-radius: 5px; background: #eff2ed; color: #526250; font-size: 12px; line-height: 1.5; }
+.analysis-job-status[data-state="running"], .analysis-job-status[data-state="succeeded"] { background: var(--pale-green); color: #126543; }
+.analysis-job-status[data-state="failed"] { background: #fdf0eb; color: #933427; }
+.analysis-job-action { display: flex; align-items: center; gap: 7px; justify-self: end; white-space: nowrap; color: #126543; font-size: 13px; font-weight: 600; }
+.analysis-job-action::after { content: ""; width: 6px; height: 6px; border: solid currentColor; border-width: 1.5px 1.5px 0 0; transform: rotate(45deg); }
+@media (max-width: 780px) {
+  .analysis-job-link { grid-template-columns: 52px minmax(0,1fr) auto; gap: 7px 9px; padding: 12px; }
+  .analysis-job-name { grid-column: 2 / -1; }
+  .analysis-job-state { grid-column: 2; }
+  .analysis-job-action { grid-column: 3; }
+}
 .toast { position: fixed; z-index: 4; bottom: 24px; left: 50%; transform: translateX(-50%); width: max-content; max-width: calc(100vw - 32px); color: white; background: #224333; padding: 11px 18px; border-radius: 8px; font-size: 14px; }
 .nav-toggle { display: none; }
 @media (min-width: 1550px) { .gallery { grid-template-columns: repeat(auto-fill,minmax(285px,1fr)); } }

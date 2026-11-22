@@ -14,10 +14,12 @@ root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root / 'dashboard' if (root / 'dashboard/server.py').is_file()
                        else root / 'state/dashboard-app'))
 from server import DashboardServer, Library
+from video_analysis_queue import Queue
 
 
 WORK_KEY = 'a' * 64
 VIDEO = '/api/videos/' + WORK_KEY + '/analysis'
+COLLECTION = '/api/video-analyses'
 WORKER = '/api/video-analysis-worker'
 HEADERS = {'X-Video-Analysis-Worker': 'local-fixture-video-analysis-worker'}
 
@@ -130,11 +132,92 @@ class VideoAnalysisApiTests(unittest.TestCase):
         self.assertEqual(self.worker('finish', **lease, result={}), {'ok': False})
 
     def test_legacy_index_still_serves_video_without_analysis(self):
+        self.assertEqual(self.request('POST', VIDEO, {})[0], 202)
         with sqlite3.connect(self.lib.database) as db:
             db.execute('ALTER TABLE recordings DROP COLUMN sha256')
         self.assertEqual(self.request('GET', VIDEO)[0], 404)
         self.assertEqual(self.request('POST', VIDEO, {})[0], 404)
         self.assertEqual(self.request('HEAD', '/media/' + WORK_KEY + '.mp4')[0], 200)
+        self.assertEqual(self.request('GET', COLLECTION), (200, {'jobs': [], 'worker_online': False}))
+
+    def test_collection_is_read_only_and_same_origin(self):
+        self.assertEqual(self.request('GET', COLLECTION), (200, {'jobs': [], 'worker_online': False}))
+        self.assertFalse(self.server.video_analysis.path.exists())
+        self.assertEqual(self.request('HEAD', COLLECTION), (200, None))
+        self.assertEqual(self.request('POST', COLLECTION, {})[0], 405)
+        self.assertEqual(self.request('GET', COLLECTION, headers={'Origin': 'https://other.example'})[0], 403)
+        self.assertEqual(self.request('HEAD', COLLECTION, headers={'Sec-Fetch-Site': 'cross-site'})[0], 403)
+        self.enable_worker()
+        self.worker('tick')
+        self.assertEqual(self.request('GET', COLLECTION), (200, {'jobs': [], 'worker_online': True}))
+
+    def test_collection_lists_public_status_without_deserializing_saved_results(self):
+        self.enable_worker()
+        self.server.video_analysis.retry_seconds = 0
+        self.lib.posters.mkdir()
+        (self.lib.posters / (WORK_KEY + '.jpg')).write_bytes(b'poster')
+        enqueued = self.request('POST', VIDEO, {})[1]['job']
+
+        def assert_summary(status, stage, completed=0, total=0):
+            code, body = self.request('GET', COLLECTION)
+            self.assertEqual(code, 200)
+            summary, = body['jobs']
+            self.assertEqual(summary, dict(id=enqueued['id'], work_key=WORK_KEY, title='测试视频', author='作者',
+                                           poster='/posters/' + WORK_KEY + '.jpg', status=status, stage=stage,
+                                           completed=completed, total=total, created_at=enqueued['created_at'],
+                                           updated_at=summary['updated_at']))
+            self.assertGreaterEqual(summary['updated_at'], summary['created_at'])
+
+        def claim_lease():
+            job = self.worker('claim')['job']
+            return dict(job_id=job['id'], lease_token=job['lease_token'])
+
+        assert_summary('queued', 'preparing')
+        lease = claim_lease()
+        self.worker('update', **lease, stage='analyzing', completed=1, total=4)
+        assert_summary('running', 'analyzing', 1, 4)
+        self.worker('fail', **lease, error='private upstream error', retryable=True)
+        assert_summary('retry_wait', 'analyzing', 1, 4)
+        self.worker('fail', **claim_lease(), error='private upstream error', retryable=False)
+        assert_summary('failed', 'preparing')
+        self.assertEqual(self.request('POST', VIDEO, {})[1]['job']['id'], enqueued['id'])
+        lease = claim_lease()
+        self.worker('update', **lease, stage='summarizing', completed=3, total=4)
+        result = {'summary': '只有详情接口读取结果'}
+        self.worker('finish', **lease, result=result)
+        self.assertEqual(self.request('GET', VIDEO)[1]['job']['result'], result)
+        with sqlite3.connect(self.server.video_analysis.path) as db:
+            db.execute('UPDATE jobs SET result=? WHERE id=?', ('invalid JSON', enqueued['id']))
+        assert_summary('succeeded', 'summarizing', 4, 4)
+
+    def test_collection_hides_superseded_jobs_and_unavailable_recordings(self):
+        queue = self.server.video_analysis
+        previous_pipeline = Queue(queue.path, pipeline_version='previous')
+        previous_pipeline.enqueue(self.lib.analysis_recording(WORK_KEY))
+        self.assertEqual(self.request('GET', COLLECTION)[1]['jobs'], [])
+        previous_digest = self.request('POST', VIDEO, {})[1]['job']
+        other_key = 'b' * 64
+        other_video = './custom/other.mp4'
+        (self.lib.media_root / other_video).write_bytes(b'x')
+        with sqlite3.connect(self.lib.database) as db:
+            db.execute('INSERT INTO works VALUES(?,?,?,?)', (other_key, '作者', '', '2026-11-22'))
+            db.execute('INSERT INTO recordings VALUES(?,?,?,?)',
+                       (other_key, other_video, 1, hashlib.sha256(b'x').hexdigest()))
+        other = self.request('POST', '/api/videos/' + other_key + '/analysis', {})[1]['job']
+        jobs = self.request('GET', COLLECTION)[1]['jobs']
+        self.assertEqual([job['id'] for job in jobs], [other['id'], previous_digest['id']])
+        self.assertEqual((jobs[0]['poster'], jobs[0]['title']), (None, '未命名作品'))
+
+        self.save_recording(b'updated video')
+        self.assertEqual([job['id'] for job in self.request('GET', COLLECTION)[1]['jobs']], [other['id']])
+        replaced = self.request('POST', VIDEO, {})[1]['job']
+        jobs = self.request('GET', COLLECTION)[1]['jobs']
+        self.assertEqual([job['id'] for job in jobs], [replaced['id'], other['id']])
+
+        self.recording.write_bytes(b'off-index change')
+        self.assertEqual([job['id'] for job in self.request('GET', COLLECTION)[1]['jobs']], [other['id']])
+        (self.lib.media_root / other_video).unlink()
+        self.assertEqual(self.request('GET', COLLECTION)[1]['jobs'], [])
 
 
 if __name__ == '__main__':

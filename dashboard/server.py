@@ -266,17 +266,21 @@ class Library:
         value = metadata.get('duration') if isinstance(metadata, dict) else None
         return value if type(value) in (int, float) and math.isfinite(value) and value > 0 else None
 
+    def recording_display(self, row):
+        key = row['work_key']
+        title = row['caption'].strip().splitlines()
+        poster = self.posters / (key + '.jpg')
+        return dict(author=row['author'], title=title[0] if title else '未命名作品',
+                    poster='/posters/' + key + '.jpg' if poster.is_file() else None)
+
     def dashboard(self):
         videos = []
         for row in self.recordings():
             key = row['work_key']
             if not re.fullmatch(KEY, key):
                 continue
-            title = row['caption'].strip().splitlines()
-            poster = self.posters / (key + '.jpg')
-            videos.append(dict(id=key, author=row['author'], title=title[0] if title else '未命名作品',
-                               published=row['published'], size=row['size'], duration=self.duration(key),
-                               url='/media/' + key + '.mp4', poster='/posters/' + key + '.jpg' if poster.is_file() else None))
+            videos.append(dict(id=key, published=row['published'], size=row['size'], duration=self.duration(key),
+                               url='/media/' + key + '.mp4', **self.recording_display(row)))
         snapshot = AuthorList(self.author_text())
         entries = [snapshot.entry(record) for record in snapshot.records.values()]
         profiles = [profile_record(record) for record in snapshot.records.values() if record.get('url')]
@@ -297,20 +301,22 @@ class Library:
 
     def analysis_recording(self, key):
         rows = self.recordings(key, include_digest=True)
-        if not rows:
+        if not rows or not self.available_for_analysis(rows[0]):
             return None
-        row = rows[0]
-        path = self.resolve_recording_path(row['path'])
+        return {field: rows[0][field] for field in ('work_key', 'path', 'sha256', 'size')}
+
+    def available_for_analysis(self, row):
         digest, size = row['sha256'], row['size']
-        if path is None or not isinstance(digest, str) or not re.fullmatch(KEY, digest):
-            return None
+        if not isinstance(digest, str) or not re.fullmatch(KEY, digest) or type(size) is not int or size <= 0:
+            return False
+        path = self.resolve_recording_path(row['path'])
+        if path is None:
+            return False
         try:
             info = path.stat()
-        except FileNotFoundError:
-            return None
-        if type(size) is not int or size <= 0 or info.st_size != size or not stat.S_ISREG(info.st_mode):
-            return None
-        return {field: row[field] for field in ('work_key', 'path', 'sha256', 'size')}
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        return info.st_size == size and stat.S_ISREG(info.st_mode)
 
 
 def local_file(root, relative):
@@ -566,17 +572,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.json_reply(400, {'error': '请求路径无效。'})
             return
         analysis = video_analysis_routes.VIDEO_PATH.fullmatch(path)
-        analysis_worker = path == video_analysis_routes.WORKER_PATH
+        analysis_route = analysis is not None or path in (video_analysis_routes.COLLECTION_PATH,
+                                                         video_analysis_routes.WORKER_PATH)
         mutating = self.command in ('POST', 'PUT', 'PATCH', 'DELETE')
-        if (mutating or analysis or analysis_worker or path.startswith('/api/public')
+        if (mutating or analysis_route or path.startswith('/api/public')
                 or path in ('/api/author-search', '/api/settings', '/api/settings/directories', '/api/logs')):
             origin = self.headers.get('Origin')
             if ((origin is not None and origin != 'http://' + hosts[0])
                     or self.headers.get('Sec-Fetch-Site', 'same-origin') not in ('same-origin', 'none')):
                 self.json_reply(403, {'error': '请从本机管理页提交。'})
                 return
-        if analysis or analysis_worker:
-            video_analysis_routes.handle(self, analysis[1] if analysis else None)
+        if analysis_route:
+            video_analysis_routes.handle(self, path, analysis[1] if analysis else None)
             return
         if path == '/api/settings':
             self.handle_settings()

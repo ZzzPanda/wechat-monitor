@@ -139,6 +139,20 @@ class Queue:
         with self._db() as db:
             return job_dict(self._by_recording(db, work_key, sha256))
 
+    def list_summaries(self):
+        if not self.path.is_file():
+            return []
+        uri = self.path.resolve().as_uri() + '?mode=ro'
+        with closing(sqlite3.connect(uri, uri=True, timeout=5)) as db:
+            db.row_factory = sqlite3.Row
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone() is None:
+                return []
+            rows = db.execute("""
+                SELECT id,work_key,sha256,status,stage,completed,total,created_at,updated_at
+                FROM jobs WHERE pipeline_version=? ORDER BY created_at DESC,rowid DESC
+            """, (self.version,))
+            return [dict(row) for row in rows]
+
     def claim(self):
         with self._db(write=True) as db:
             now = int(time.time())
