@@ -1,5 +1,12 @@
 """The portable installer must not use partial or invalid downloads as executables."""
 import hashlib
+import io
+import json
+import os
+import platform
+import shlex
+import subprocess
+import tarfile
 from pathlib import Path
 import sys
 import tempfile
@@ -52,3 +59,50 @@ class HostToolDownloadTests(unittest.TestCase):
                 host_tools.fetch('sample', self.cache)
         self.assertFalse(host_tools.valid(target, self.spec))
         self.assertEqual(list(self.cache.iterdir()), [target])
+
+
+@unittest.skipUnless(sys.platform == 'darwin' and platform.machine() == 'arm64' and
+                     int(platform.mac_ver()[0].split('.')[0]) >= 15, 'supported macOS Apple Silicon bootstrap')
+class ShellBootstrapTests(unittest.TestCase):
+    def test_bootstrap_resumes_partial_transfer_and_preserves_cli_arguments(self):
+        with tempfile.TemporaryDirectory() as folder:
+            work = Path(folder)
+            repo = work / 'source repo'
+            deploy = repo / 'deploy'
+            deploy.mkdir(parents=True)
+            bundle = work / 'pinned.tgz'
+            launcher = ('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' "$@"\n').encode()
+            with tarfile.open(bundle, 'w:gz') as archive:
+                entry = tarfile.TarInfo('python/bin/python3.12')
+                entry.size = len(launcher)
+                entry.mode = 0o755
+                archive.addfile(entry, io.BytesIO(launcher))
+            data = bundle.read_bytes()
+            spec = dict(name=bundle.name, size=len(data), sha256=hashlib.sha256(data).hexdigest(),
+                        url='https://primary.example/pinned', fallback='https://secondary.example/pinned')
+            (deploy / 'host-tools.lock.json').write_text(json.dumps({'python': spec}))
+            fake = work / 'fake-curl'
+            response = work / 'download.py'
+            response.write_text(
+                'from pathlib import Path\nimport sys\n'
+                'assert sys.argv[1] == "--disable"\n'
+                'file = Path(sys.argv[sys.argv.index("-o")+1])\n'
+                'data = Path(__file__).with_name("pinned.tgz").read_bytes()\n'
+                'if not file.exists():\n'
+                '    file.write_bytes(data[:10])\n    sys.exit(18)\n'
+                'assert "--continue-at" in sys.argv and file.read_bytes() == data[:10]\n'
+                'file.write_bytes(file.read_bytes() + data[10:])\n')
+            fake.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' ' +
+                            shlex.quote(str(response)) + ' \"$@\"\n')
+            fake.chmod(0o755)
+            source = host_tools.HERE.parent / 'deploy.sh'
+            start = repo / 'deploy.sh'
+            start.write_text(source.read_text().replace('/usr/bin/curl', shlex.quote(str(fake))))
+            start.chmod(0o755)
+            (deploy / 'install.py').write_text('import json,sys; print(json.dumps(sys.argv[1:]))')
+            args = ['--data-dir', str(work / '新的 目录'), '--port-base', '34721']
+            env = dict(HOME=str(work / 'home'), PATH=os.defpath)
+            first = subprocess.check_output([start, *args], env=env, text=True)
+            self.assertEqual(json.loads(first), args)
+            fake.unlink()
+            self.assertEqual(subprocess.check_output([start, *args], env=env, text=True), first)
