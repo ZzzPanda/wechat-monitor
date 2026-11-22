@@ -26,36 +26,45 @@ def valid(path, spec):
         return digest.hexdigest() == spec['sha256']
 
 
+def download_release(spec, urls, target, pending):
+    if valid(target, spec):
+        return target
+    if pending.is_file() and pending.stat().st_size >= spec['size']:
+        if valid(pending, spec):
+            os.replace(pending, target)
+            return target
+        pending.unlink()
+    print(f"正在下载 {spec['name']}（{spec['size'] / 1e6:.1f} MB）…", flush=True)
+    for url in urls:
+        for _ in range(3):
+            resume = ['--continue-at', '-'] if pending.is_file() and pending.stat().st_size else []
+            # Disable user curlrc options. curl drops Authorization on cross-host redirects by default.
+            auth = ['-H', 'Authorization: Bearer QQ=='] if url.startswith('https://ghcr.io/v2/homebrew/') else []
+            command = ['/usr/bin/curl', '--disable', '--fail', '--location', '--silent', '--show-error',
+                       '--proto', '=https', '--proto-redir', '=https', '--connect-timeout', '20',
+                       '--retry', '2', '--speed-limit', '512', '--speed-time', '60',
+                       '--max-filesize', str(spec['size']), *resume, *auth, '-H',
+                       'Accept: application/octet-stream', '-o', str(pending), url]
+            result = subprocess.run(command)
+            if result.returncode == 0:
+                if valid(pending, spec):
+                    os.replace(pending, target)
+                    return target
+                pending.unlink(missing_ok=True)
+                break  # Complete response with wrong digest: try the alternate source.
+            if resume and result.returncode in (22, 33, 36):
+                pending.unlink(missing_ok=True)  # Server rejected the range; restart from byte zero.
+            elif result.returncode not in (18, 28, 56):
+                break
+    raise RuntimeError(f"{spec['name']} 下载或 SHA-256 校验失败，已验证的其他组件可在重试时复用。")
+
+
 def fetch(name, cache):
     spec = LOCK[name]
     target = cache / spec['name']
-    if valid(target, spec):
-        return target
-    print(f"正在下载 {spec['name']}（{spec['size'] / 1e6:.1f} MB）…", flush=True)
     with tempfile.TemporaryDirectory(dir=cache) as stage:
-        pending = Path(stage) / 'download'
-        for url in [spec['url'], spec.get('fallback')]:
-            if not url:
-                continue
-            for _ in range(3):
-                # Some networks cut long responses short. Resume a partial object when the origin supports ranges.
-                resume = ['--continue-at', '-'] if pending.is_file() and pending.stat().st_size else []
-                command = ['/usr/bin/curl', '--fail', '--location', '--silent', '--show-error', '--proto', '=https',
-                           '--proto-redir', '=https', '--connect-timeout', '20', '--retry', '2', '--speed-limit', '512',
-                           '--speed-time', '60', '--max-filesize', str(spec['size']), *resume, '-H',
-                           'Accept: application/octet-stream', '-o', str(pending), url]
-                result = subprocess.run(command)
-                if result.returncode == 0:
-                    if valid(pending, spec):
-                        os.replace(pending, target)
-                        return target
-                    pending.unlink(missing_ok=True)
-                    break  # Complete response with wrong digest: try the alternate source.
-                if resume and result.returncode in (22, 33, 36):
-                    pending.unlink(missing_ok=True)  # Server rejected the range, restart once from byte zero.
-                elif result.returncode not in (18, 28, 56):
-                    break
-    raise RuntimeError(f"{spec['name']} 下载或 SHA-256 校验失败，已验证的其他组件可在重试时复用。")
+        return download_release(spec, [url for url in (spec['url'], spec.get('fallback')) if url],
+                                target, Path(stage) / 'download')
 
 
 def install_tool(name, cache, tools):

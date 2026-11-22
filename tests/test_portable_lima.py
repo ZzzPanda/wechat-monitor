@@ -4,6 +4,7 @@ import io
 from pathlib import Path
 import tarfile
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -15,6 +16,51 @@ spec.loader.exec_module(bootstrap)
 
 
 class PortableLimaTests(unittest.TestCase):
+    def test_guest_download_survives_a_separate_invocation(self):
+        content = b'image'
+        source = ('guest.raw.gz', ('https://github.com/example/release',), len(content),
+                  hashlib.sha256(content).hexdigest())
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            def interrupted(command):
+                pending = Path(command[command.index('-o') + 1])
+                if not pending.exists():
+                    pending.write_bytes(content[:2])
+                return SimpleNamespace(returncode=18)
+
+            with patch.object(bootstrap.subprocess, 'run', side_effect=interrupted):
+                with self.assertRaises(RuntimeError):
+                    bootstrap.artifact(root, source)
+            self.assertFalse((root / source[0]).exists())
+
+            def resumed(command):
+                self.assertIn('--continue-at', command)
+                self.assertNotIn('Authorization: Bearer QQ==', command)
+                pending = Path(command[command.index('-o') + 1])
+                self.assertEqual(pending.read_bytes(), content[:2])
+                with pending.open('ab') as out:
+                    out.write(content[2:])
+                return SimpleNamespace(returncode=0)
+
+            with patch.object(bootstrap.subprocess, 'run', side_effect=resumed) as curl:
+                self.assertEqual(bootstrap.artifact(root, source).read_bytes(), content)
+                self.assertEqual(bootstrap.artifact(root, source).read_bytes(), content)
+                curl.assert_called_once()
+            self.assertEqual([path.name for path in root.iterdir()], [source[0]])
+
+    def test_bottle_uses_https_and_drops_credentials_on_cross_host_redirects(self):
+        with TemporaryDirectory() as folder:
+            def inspect(command):
+                self.assertEqual(command[1], '--disable')
+                self.assertEqual(command[command.index('--proto-redir') + 1], '=https')
+                self.assertIn('Authorization: Bearer QQ==', command)
+                self.assertNotIn('--location-trusted', command)
+                return SimpleNamespace(returncode=22)
+            with patch.object(bootstrap.subprocess, 'run', side_effect=inspect) as curl:
+                with self.assertRaises(RuntimeError):
+                    bootstrap.artifact(Path(folder), bootstrap.LIMA_SEQUOIA)
+                curl.assert_called_once()
+
     def test_sequoia_install_survives_macos_upgrade_and_rejects_changed_binary(self):
         with TemporaryDirectory() as folder:
             root = Path(folder).resolve()

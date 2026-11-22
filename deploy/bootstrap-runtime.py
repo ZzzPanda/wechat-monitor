@@ -4,7 +4,6 @@ import argparse
 import fcntl
 import gzip
 import hashlib
-from http.client import HTTPException
 import json
 import os
 import platform
@@ -14,7 +13,9 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path, PurePosixPath
-from urllib.request import Request, urlopen
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from host_tools import download_release
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from wechat_paths import check_drive, child_on_drive, lima_home, resolve_root
@@ -59,37 +60,12 @@ def volume_dir(path, parent):
 def artifact(cache, source):
     name, urls, size, sha = source
     target = cache / name
-    if target.is_symlink():
-        raise ValueError(f'缓存文件不可为符号链接：{target}')
-    if target.is_file() and target.stat().st_size == size and digest(target) == sha:
-        return target
-    print(f'获取 {name}（{size // 1024**2} MiB）', flush=True)
-    errors = []
-    for url in urls:
-        try:
-            request = Request(url, headers={'User-Agent': 'wechat-monitor-deploy',
-                                            'Accept': 'application/octet-stream'})
-            if url.startswith('https://ghcr.io/v2/homebrew/'):
-                # Homebrew's anonymous bottle credential; do not forward it to storage redirects.
-                request.add_unredirected_header('Authorization', 'Bearer QQ==')
-            with tempfile.TemporaryDirectory(dir=cache) as work:
-                pending = Path(work) / name
-                with urlopen(request, timeout=90) as response, pending.open('xb') as out:
-                    if not response.geturl().startswith('https://'):
-                        raise ValueError('下载地址未使用 HTTPS')
-                    h = hashlib.sha256()
-                    for block in iter(lambda: response.read(BLOCK), b''):
-                        out.write(block)
-                        if out.tell() > size:
-                            raise ValueError('下载长度超过发行文件')
-                        h.update(block)
-                    if out.tell() != size or h.hexdigest() != sha:
-                        raise ValueError('发行文件的长度或 SHA-256 不匹配')
-                os.replace(pending, target)
-                return target
-        except (OSError, ValueError, HTTPException) as exc:
-            errors.append(str(exc))
-    raise RuntimeError(f'{name} 获取失败：' + ' / '.join(errors))
+    # prepare() serializes these stable partials across installer restarts.
+    pending = cache / ('.' + name + '.' + sha[:12] + '.part')
+    for path in (target, pending):
+        if path.is_symlink() or path.exists() and not path.is_file():
+            raise ValueError(f'缓存路径必须是普通文件：{path}')
+    return download_release({'name': name, 'size': size, 'sha256': sha}, urls, target, pending)
 
 
 def unpack_lima(archive, tree, bottle=False):

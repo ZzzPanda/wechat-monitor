@@ -27,11 +27,38 @@ if [ ! -x "$python" ]; then
     trap '/bin/rm -rf "$work" "$transfer"' EXIT
     trap 'exit 130' HUP INT TERM
     valid() { [ -f "$1" ] && [ "$(/usr/bin/shasum -a 256 "$1" | /usr/bin/cut -d " " -f1)" = "$sha" ]; }
+    download_python() {
+        url=$1
+        pending="$transfer/archive"
+        attempt=0
+        while [ "$attempt" -lt 3 ]; do
+            attempt=$((attempt + 1))
+            set -- /usr/bin/curl --disable -fLsS --proto '=https' --proto-redir '=https' --connect-timeout 20 \
+                --retry 2 --speed-limit 512 --speed-time 60 --max-filesize "$(field size)" -H 'Accept: application/octet-stream'
+            resumed=no
+            if [ -s "$pending" ]; then
+                set -- "$@" --continue-at -
+                resumed=yes
+            fi
+            if "$@" -o "$pending" "$url"; then
+                if valid "$pending"; then return 0; fi
+                /bin/rm -f "$pending"
+                return 1
+            else
+                failure=$?
+            fi
+            case $failure in
+                18|28|56) continue ;;
+                22|33|36) [ "$resumed" = yes ] || return 1; /bin/rm -f "$pending" ;;
+                *) return 1 ;;
+            esac
+        done
+        return 1
+    }
     if ! valid "$archive"; then
         echo '正在下载私有 Python 3.12（约 25 MB）…' >&2
         for url in "$(field url)" "$(field fallback)"; do
-            if /usr/bin/curl -fLsS --proto '=https' --proto-redir '=https' --connect-timeout 20 --retry 2 --speed-limit 512 --speed-time 60 --max-filesize "$(field size)" \
-                    -H 'Accept: application/octet-stream' "$url" -o "$transfer/archive" && valid "$transfer/archive"; then
+            if download_python "$url"; then
                 /bin/mv -f "$transfer/archive" "$archive"
                 break
             fi

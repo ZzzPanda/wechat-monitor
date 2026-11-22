@@ -45,7 +45,7 @@ probes:
     #!/bin/sh
     set -eu
     docker info >/dev/null
-  hint: Check Docker in the external VM.
+  hint: Check Docker in the dedicated WeChat VM.
 portForwards:
 - guestSocket: /var/run/docker.sock
   hostSocket: '{{.Dir}}/sock/docker.sock'

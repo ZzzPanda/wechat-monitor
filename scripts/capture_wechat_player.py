@@ -423,7 +423,7 @@ class LiveCapture:
         self.output = Path(output).expanduser().resolve()
         allowed = [BASE/'media', BASE/'tmp']
         if self.output.suffix.lower() != '.mp4' or not any(d.resolve() in self.output.parents for d in allowed):
-            raise ValueError('output must be a new MP4 under the external media or tmp directory')
+            raise ValueError('output must be a new MP4 in the selected instance’s media or tmp directory')
         self.origin = None
         self.video_wall_origin = None
         self.actual_window = None
@@ -630,7 +630,7 @@ def main():
     parser.add_argument('--crop', required=True, metavar='X,Y,W,H', help='picture relative to the window')
     parser.add_argument('--duration', type=float, default=10)
     parser.add_argument('--fps', type=int, default=24)
-    parser.add_argument('--output', type=Path, help='new MP4 within external media/ or tmp/')
+    parser.add_argument('--output', type=Path, help='new MP4 within the selected instance’s media/ or tmp/')
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
     try:
