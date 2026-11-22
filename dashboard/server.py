@@ -12,18 +12,31 @@ import re
 import secrets
 import sqlite3
 import stat
+import sys
 import tempfile
 import time
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Optional
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from crawl_queue import Queue
+import public_routes
+import video_analysis_routes
+from public_articles import PublicArticles
+from crawl_queue import LAST_UNIX_SECOND, Queue
 from account_search import AccountSelections, DesktopSearch, SearchUnavailable, profile_record, valid_text
+from video_analysis_queue import Queue as VideoAnalysisQueue
+
+# The deployed dashboard has a copy of this module next to server.py.
+sys.path.append(str(Path(__file__).resolve().parents[1] / 'scripts'))
+from wechat_events import CATEGORIES, RESULT_LIMIT, read_events, write_event
+from wechat_settings import (
+    DEFAULT_STORAGE_PATH, SETTINGS_FILENAME, STORAGE_ROOT, SettingsError, SettingsStore, indexed_path,
+)
 
 
-ROOT = Path('/Volumes/ssd1/wechat-monitor')
+ROOT = STORAGE_ROOT.parent
 KEY = r'[0-9a-f]{64}'
 LOCAL_HOST = re.compile(r'(?:127\.0\.0\.1|localhost|\[::1\])(?::[0-9]{1,5})?', re.I)
 RANGE = re.compile(r'bytes=([0-9]*)-([0-9]*)')
@@ -123,15 +136,20 @@ class Library:
     media: Path
     posters: Path
     static: Path
+    media_root: Optional[Path] = None
+    storage_root: Path = STORAGE_ROOT
 
     @classmethod
     def configured(cls):
+        media = os.getenv('DASHBOARD_MEDIA')
+        media_root = os.getenv('DASHBOARD_MEDIA_ROOT')
         return cls(
             Path(os.getenv('DASHBOARD_AUTHORS', ROOT / 'state/monitoring/authors.txt')),
             Path(os.getenv('DASHBOARD_DB', ROOT / 'state/wechat-pilot/previews.sqlite3')),
-            Path(os.getenv('DASHBOARD_MEDIA', ROOT / 'media/微信视频号')),
+            Path(media) if media else DEFAULT_STORAGE_PATH,
             Path(os.getenv('DASHBOARD_POSTERS', ROOT / 'state/posters')),
             Path(__file__).resolve().with_name('static'),
+            Path(media_root) if media_root else (None if media else STORAGE_ROOT),
         )
 
     def author_text(self):
@@ -220,16 +238,22 @@ class Library:
             snapshot.current(name, version)
             self.write_change(snapshot, name, None)
 
-    def recordings(self, key=None):
+    def recordings(self, key=None, *, include_digest=False):
         if not self.database.is_file():
             return []
-        sql = ('SELECT r.work_key, r.path, r.size, w.author, w.caption, w.published '
-               'FROM recordings r JOIN works w ON r.work_key = w.fingerprint')
         with closing(sqlite3.connect(self.database.resolve().as_uri() + '?mode=ro', uri=True, timeout=3)) as db:
             db.row_factory = sqlite3.Row
             tables = db.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('works','recordings')").fetchone()[0]
             if tables != 2:
                 return []
+            digest_column = ''
+            if include_digest:
+                columns = {column['name'] for column in db.execute('PRAGMA table_info(recordings)')}
+                if 'sha256' not in columns:
+                    return []
+                digest_column = ', r.sha256'
+            sql = ('SELECT r.work_key, r.path, r.size, w.author, w.caption, w.published' + digest_column +
+                   ' FROM recordings r JOIN works w ON r.work_key = w.fingerprint')
             if key is not None:
                 return db.execute(sql + ' WHERE r.work_key=?', (key,)).fetchall()
             return db.execute(sql + ' ORDER BY w.published DESC, r.work_key').fetchall()
@@ -257,6 +281,36 @@ class Library:
         entries = [snapshot.entry(record) for record in snapshot.records.values()]
         profiles = [profile_record(record) for record in snapshot.records.values() if record.get('url')]
         return dict(authors=list(snapshot.records), profiles=profiles, entries=entries, videos=videos)
+
+    def recording_file(self, key):
+        rows = self.recordings(key)
+        path = self.resolve_recording_path(rows[0]['path']) if rows else None
+        return path if path is not None and path.is_file() else None
+
+    def resolve_recording_path(self, value):
+        if not isinstance(value, str) or (self.media_root is None and value.startswith('./')):
+            return None
+        try:
+            return indexed_path(self.media_root or self.media, self.media, value)
+        except ValueError:
+            return None
+
+    def analysis_recording(self, key):
+        rows = self.recordings(key, include_digest=True)
+        if not rows:
+            return None
+        row = rows[0]
+        path = self.resolve_recording_path(row['path'])
+        digest, size = row['sha256'], row['size']
+        if path is None or not isinstance(digest, str) or not re.fullmatch(KEY, digest):
+            return None
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            return None
+        if type(size) is not int or size <= 0 or info.st_size != size or not stat.S_ISREG(info.st_mode):
+            return None
+        return {field: row[field] for field in ('work_key', 'path', 'sha256', 'size')}
 
 
 def local_file(root, relative):
@@ -288,7 +342,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def log_request(self, code='-', size='-'):
         # Queue progress lives in SQLite. Keep the periodic heartbeat out of Docker logs.
-        if code == 200 and self.command == 'POST' and self.path == '/api/crawl-worker':
+        if code == 200 and self.command == 'POST' and self.path in (
+                '/api/crawl-worker', video_analysis_routes.WORKER_PATH):
             return
         super().log_request(code, size)
 
@@ -344,13 +399,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self.wfile.write(chunk)
                     left -= len(chunk)
 
-    def read_json(self):
+    def read_json(self, max_length=4096):
         if self.headers.get_content_type() != 'application/json':
             self.json_reply(415, {'error': '预期 JSON 请求。'})
             return
         length = self.headers.get('Content-Length', '')
-        if (self.headers.get('Transfer-Encoding') or not re.fullmatch(r'[0-9]{1,4}', length)
-                or not 0 < int(length) <= 4096):
+        if (self.headers.get('Transfer-Encoding') or not length.isascii() or not length.isdecimal()
+                or len(length) > len(str(max_length)) or not 0 < int(length) <= max_length):
             self.json_reply(400, {'error': '请求长度无效。'})
             return
         try:
@@ -397,8 +452,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 raise ValueError('请提供定时开关、采集间隔和首次运行时间。')
             if 'start_at' in data and type(data['start_at']) is not int:
                 raise ValueError('首次运行时间无效。')
-            self.json_reply(200, dict(settings=queue.configure(data['enabled'], data['interval_minutes'],
-                                                               data.get('start_at'))))
+            settings = queue.configure(data['enabled'], data['interval_minutes'], data.get('start_at'))
+            write_event(lib.authors.parent, 'crawl', 'info', '已保存定时采集设置。')
+            self.json_reply(200, dict(settings=settings))
         elif method == 'POST' and path == '/api/crawls':
             if set(data) != {'name', 'version'}:
                 raise ValueError('请从监控名单中选择账号。')
@@ -415,12 +471,85 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 raise ValueError('停止请求格式无效。')
             self.json_reply(200, dict(job=queue.cancel(match[1])))
         elif method == 'POST' and path == '/api/crawl-worker':
-            if not self.server.worker_authorized(self.headers.get('X-Crawl-Worker', '')):
-                self.json_reply(403, {'error': '仅采集进程可访问。'})
-                return
             self.json_reply(200, self.server.worker_call(data))
         else:
             self.json_reply(404, {'error': '接口不存在。'})
+
+    def handle_settings(self):
+        store = self.server.settings
+        try:
+            if self.command in ('GET', 'HEAD'):
+                self.json_reply(200, store.public())
+            elif self.command == 'PUT':
+                data = self.read_json(max_length=32768)
+                if data is not None:
+                    settings = store.update(data)
+                    write_event(self.server.library.authors.parent, 'system', 'info', '已保存管理台设置。')
+                    self.json_reply(200, settings)
+            else:
+                self.json_reply(405, {'error': '此方法不适用于配置接口。'})
+        except (OSError, SettingsError):
+            self.json_reply(503, {'error': '暂时无法访问配置，请检查外置盘后重试。'})
+        except ValueError as err:
+            self.json_reply(400, {'error': str(err)})
+
+    def handle_directories(self):
+        if self.command not in ('GET', 'HEAD'):
+            self.json_reply(405, {'error': '此方法不适用于目录浏览接口。'})
+            return
+        try:
+            query = urlsplit(self.path).query
+            params = parse_qs(query, keep_blank_values=True, max_num_fields=1,
+                              strict_parsing=True, errors='strict') if query else {}
+            if params.keys() - {'path'}:
+                raise ValueError
+        except ValueError:
+            self.json_reply(400, {'error': '目录浏览请求格式无效。'})
+            return
+        try:
+            self.json_reply(200, self.server.settings.directories(params.get('path', [None])[0]))
+        except FileNotFoundError:
+            self.json_reply(404, {'error': '文件夹不存在，可能已被移动。'})
+        except OSError:
+            self.json_reply(503, {'error': '暂时无法读取这个文件夹，请检查外置盘或访问权限。'})
+        except ValueError as err:
+            self.json_reply(400, {'error': str(err)})
+
+    def handle_logs(self):
+        if self.command not in ('GET', 'HEAD'):
+            self.json_reply(405, {'error': '此方法不适用于日志接口。'})
+            return
+        try:
+            params = parse_qs(urlsplit(self.path).query, keep_blank_values=True, max_num_fields=3)
+            if params.keys() - {'category', 'start', 'end'} or any(len(values) != 1 for values in params.values()):
+                raise ValueError
+            category = params.get('category', ['all'])[0]
+            if category != 'all' and category not in CATEGORIES:
+                raise ValueError
+            if 'start' in params or 'end' in params:
+                raw = [params.get(name, [''])[0] for name in ('start', 'end')]
+                if not all(re.fullmatch(r'[0-9]{1,12}', value) for value in raw):
+                    raise ValueError
+                start, end = map(int, raw)
+                if start > end or end > LAST_UNIX_SECOND:
+                    raise ValueError
+            else:
+                end = int(time.time())
+                start = max(0, end - 86400)
+        except ValueError:
+            self.json_reply(400, {'error': '请选择有效的日志分区和时间范围。'})
+            return
+        try:
+            limit = RESULT_LIMIT + 1
+            entries = read_events(self.server.library.authors.parent, category, start, end, limit)
+            if category in ('all', 'crawl'):
+                entries.extend(self.server.crawls.log_entries(start, end, limit))
+                entries.extend(self.server.public_articles.log_entries(start, end, limit))
+                entries.sort(key=lambda entry: entry['time'], reverse=True)
+            self.json_reply(200, dict(entries=entries[:RESULT_LIMIT], truncated=len(entries) > RESULT_LIMIT))
+        except (OSError, sqlite3.Error) as err:
+            self.log_error('Logs unavailable: %s', err)
+            self.json_reply(503, {'error': '暂时无法读取日志，请稍后重试。'})
 
     def handle_site(self):
         hosts = self.headers.get_all('Host') or []
@@ -436,13 +565,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if '\x00' in path:
             self.json_reply(400, {'error': '请求路径无效。'})
             return
-        if self.command in ('POST', 'PATCH', 'DELETE') or path == '/api/author-search':
+        analysis = video_analysis_routes.VIDEO_PATH.fullmatch(path)
+        analysis_worker = path == video_analysis_routes.WORKER_PATH
+        mutating = self.command in ('POST', 'PUT', 'PATCH', 'DELETE')
+        if (mutating or analysis or analysis_worker or path.startswith('/api/public')
+                or path in ('/api/author-search', '/api/settings', '/api/settings/directories', '/api/logs')):
             origin = self.headers.get('Origin')
             if ((origin is not None and origin != 'http://' + hosts[0])
                     or self.headers.get('Sec-Fetch-Site', 'same-origin') not in ('same-origin', 'none')):
                 self.json_reply(403, {'error': '请从本机管理页提交。'})
                 return
-        if path == '/api/author-search':
+        if analysis or analysis_worker:
+            video_analysis_routes.handle(self, analysis[1] if analysis else None)
+            return
+        if path == '/api/settings':
+            self.handle_settings()
+            return
+        if path == '/api/settings/directories':
+            self.handle_directories()
+            return
+        if path == '/api/logs':
+            self.handle_logs()
+            return
+        if path in ('/api/author-search', '/api/public/search'):
             if self.command != 'GET' or self.headers.get('Sec-Fetch-Dest', 'empty') != 'empty':
                 self.json_reply(400, {'error': '请在管理页中搜索。'})
                 return
@@ -453,17 +598,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
             query = params.get('q', [])
             if (len(query) != 1 or not valid_text(query[0], 64)
                     or params.keys() - {'q', 'fresh'} or params.get('fresh', ['1']) != ['1']):
-                self.json_reply(400, {'error': '请输入 1 至 64 个字符的视频号名称。'})
+                self.json_reply(400, {'error': '请输入 1 至 64 个字符的账号名称。'})
                 return
             try:
-                response = self.server.selections.find(query[0].strip(), fresh='fresh' in params)
+                selections = self.server.public_selections if path == '/api/public/search' else self.server.selections
+                response = selections.find(query[0].strip(), fresh='fresh' in params)
             except SearchUnavailable as err:
                 self.json_reply(503, {'error': str(err)})
                 return
             self.json_reply(200, response)
             return
-        if self.command in ('POST', 'PATCH', 'DELETE'):
-            data = self.read_json()
+        if path == '/api/public' or path.startswith('/api/public/'):
+            try:
+                reply = public_routes.handle_public(self, path)
+                if reply is not None:
+                    self.json_reply(*reply)
+            except public_routes.AccountConflict as err:
+                self.json_reply(409, {'error': str(err)})
+            except ValueError as err:
+                self.json_reply(400, {'error': str(err)})
+            except KeyError:
+                self.json_reply(404, {'error': '未找到公众号、文章或任务。'})
+            return
+        if mutating:
+            worker = self.command == 'POST' and path == '/api/crawl-worker'
+            if worker and not self.server.worker_authorized(self.headers.get('X-Crawl-Worker', '')):
+                self.json_reply(403, {'error': '仅采集进程可访问。'})
+                return
+            data = self.read_json(max_length=8 * 1024 * 1024 if worker else 4096)
             if data is None:
                 return
             try:
@@ -482,9 +644,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == '/api/dashboard':
             self.json_reply(200, lib.dashboard())
         elif (match := re.fullmatch(r'/media/(' + KEY + r')\.mp4', path)):
-            rows = lib.recordings(match[1])
-            file = local_file(lib.media, rows[0]['path']) if rows else None
-            self.serve_file(file, 'video/mp4', seekable=True)
+            self.serve_file(lib.recording_file(match[1]), 'video/mp4', seekable=True)
         elif (match := re.fullmatch(r'/posters/(' + KEY + r')\.jpg', path)):
             self.serve_file(local_file(lib.posters, match[1] + '.jpg'), 'image/jpeg')
         else:
@@ -501,43 +661,67 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.log_error('Dashboard unavailable: %s', err)
             self.json_reply(503, {'error': '暂时无法读取视频库或写入名单，请稍后重试。'})
 
-    do_GET = do_HEAD = do_POST = do_PATCH = do_DELETE = respond
+    do_GET = do_HEAD = do_POST = do_PUT = do_PATCH = do_DELETE = respond
 
 
 class DashboardServer(ThreadingHTTPServer):
-    def __init__(self, address, library, search=None):
+    def __init__(self, address, library, search=None, public_search=None):
         super().__init__(address, DashboardHandler)
         self.library = library
         self.selections = AccountSelections(search or DesktopSearch(library.authors.parent))
+        self.public_selections = AccountSelections(
+            public_search or DesktopSearch(library.authors.parent, kind='public'),
+            validate=public_routes.public_candidate, label='公众号')
+        self.public_articles = PublicArticles(library.authors.parent / 'public-articles.sqlite3')
+        self.settings = SettingsStore(library.authors.parent / SETTINGS_FILENAME, library.storage_root,
+                                      library.media_root)
 
         self.last_tick = float('-inf')
         self.crawls = Queue(library.authors.parent / 'crawl.sqlite3')
+        self.last_video_analysis_tick = float('-inf')
+        self.video_analysis = VideoAnalysisQueue(library.authors.parent / 'video-analysis.sqlite3')
 
-    def worker_authorized(self, supplied):
+    def worker_authorized(self, supplied, key_name='crawl-worker.key'):
         try:
-            secret = (self.library.authors.parent / 'crawl-worker.key').read_text().strip()
-            return len(secret) >= 32 and supplied.isascii() and hmac.compare_digest(secret, supplied)
-        except FileNotFoundError:
+            secret = (self.library.authors.parent / key_name).read_text().strip()
+            return len(secret) >= 32 and secret.isascii() and supplied.isascii() and hmac.compare_digest(secret, supplied)
+        except (FileNotFoundError, UnicodeError):
             return False
 
     def worker_call(self, data):
         queue = self.crawls
+        articles = self.public_articles
         op = data.get('op')
         if op == 'tick':
             queue.schedule(self.library.entries())
+            articles.schedule()
             self.last_tick = time.monotonic()
-            return dict(queued=queue.has_queued())
+            return dict(queued=queue.has_queued() or articles.has_queued())
         elif op == 'claim':
+            video = queue.next_queued()
+            article = articles.next_queued()
+            if article and (not video or (article['mode'] != 'incremental', article['created_at'])
+                            < (video['mode'] != 'incremental', video['created_at'])):
+                job = articles.claim()
+                if job:
+                    return dict(job=dict(job, source='public'))
             return dict(job=queue.claim(self.library.entries()))
         elif op == 'active':
             boundary = data.get('boundary', False)
             if type(boundary) is not bool:
                 raise ValueError('作品边界标记无效。')
-            return queue.activity(data['id'], data['author'], data['profile_url'], self.library.entries(), boundary)
+            state = queue.activity(data['id'], data['author'], data['profile_url'], self.library.entries(), boundary)
+            if boundary and state['active'] and (articles.next_queued() or {}).get('mode') == 'incremental':
+                state['yield_requested'] = True
+            return state
         elif op == 'yield_history':
-            return dict(yielded=queue.yield_history(data['id'], data['checkpoint']))
+            waiting = (articles.next_queued() or {}).get('mode') == 'incremental'
+            return dict(yielded=queue.yield_history(data['id'], data['checkpoint'], external_incremental=waiting))
         elif op == 'recover':
             queue.recover()
+            articles.recover()
+        elif isinstance(op, str) and op.startswith('public_'):
+            return public_routes.worker_call(articles, op[len('public_'):], data, queue)
         elif op == 'seen_before':
             last_complete = queue.last_complete_at(data['profile_url'])
             boundary = last_complete if last_complete is not None else queue.initial_baseline_at(data['profile_url'])

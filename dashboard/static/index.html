@@ -5,31 +5,53 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <meta name="theme-color" content="#f7f8f6">
-  <title>视频资料库 · 视频号监控台</title>
+  <title>视频资料库 · 微信监控台</title>
   <link rel="stylesheet" href="/style.css">
+  <script src="/account_directory.js" defer></script>
   <script src="/app.js" defer></script>
+  <script src="/public.js" defer></script>
+  <script src="/video_analysis.js" defer></script>
 </head>
 <body>
-  <a class="skip-link" href="#main">跳至视频列表</a>
+  <a class="skip-link" href="#main">跳至主要内容</a>
   <div class="workspace">
-    <aside class="rail" aria-label="资料库导航">
+    <aside class="rail" aria-label="监控台侧栏">
       <div class="brand-bar">
-        <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i></span>视频号监控台</div>
-        <button type="button" id="nav-toggle" class="nav-toggle quiet-button" aria-controls="navigation" aria-expanded="false">作者筛选<span class="chevron" aria-hidden="true"></span></button>
+        <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i></span>微信监控台</div>
+        <button type="button" id="nav-toggle" class="nav-toggle quiet-button" aria-controls="navigation" aria-expanded="false">导航<span class="chevron" aria-hidden="true"></span></button>
       </div>
-      <nav id="navigation" class="navigation" aria-label="视频和作者">
+      <nav id="navigation" class="navigation" aria-label="主导航">
         <h2 class="nav-heading">资料库</h2>
-        <button type="button" id="all-videos" class="nav-item current" aria-current="page">
+        <a href="#main" id="all-videos" class="nav-item current" aria-current="page">
           <span class="grid-icon" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
           <span class="nav-name">全部视频</span><span class="nav-count" id="all-count"></span>
-        </button>
+        </a>
+        <a href="#public" id="open-public" class="nav-item">
+          <span class="article-icon" aria-hidden="true"></span><span class="nav-name">全部文章</span><span class="nav-count" id="public-all-count"></span>
+        </a>
+        <a href="#logs" id="open-logs" class="nav-item">
+          <span class="logs-icon" aria-hidden="true"><i></i></span>
+          <span class="nav-name">日志</span>
+        </a>
+        <a href="#settings" id="open-settings" class="nav-item">
+          <span class="settings-icon" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="nav-name">设置</span>
+        </a>
         <div class="author-group">
-          <h2 class="nav-heading">监控视频号</h2>
+          <h2 class="nav-group-heading">
+            <a href="#video-accounts" id="open-video-accounts" class="nav-directory" aria-label="查看全部监控视频号">
+              <span>监控视频号</span><span class="nav-directory-more" aria-hidden="true">查看全部</span>
+            </a>
+          </h2>
           <div id="authors"></div>
         </div>
-        <div id="past-group" class="author-group" hidden>
-          <h2 class="nav-heading">历史作者</h2>
-          <div id="past-authors"></div>
+        <div class="author-group">
+          <h2 class="nav-group-heading">
+            <a href="#official-accounts" id="open-official-accounts" class="nav-directory" aria-label="查看全部监控公众号">
+              <span>监控公众号</span><span class="nav-directory-more" aria-hidden="true">查看全部</span>
+            </a>
+          </h2>
+          <div id="public-accounts"></div>
         </div>
       </nav>
       <div class="storage" id="storage" hidden>
@@ -38,7 +60,7 @@
       </div>
     </aside>
 
-    <main id="main" class="main">
+    <main id="main" class="main" tabindex="-1">
       <header class="page-header">
         <div>
           <h1 id="page-title">视频资料库</h1>
@@ -102,7 +124,247 @@
         </div>
       </section>
     </main>
+
+    <main id="public" class="main" tabindex="-1" hidden>
+      <header class="page-header">
+        <div>
+          <h1 id="public-title">文章资料库</h1>
+          <div class="page-metadata"><p class="summary" id="public-summary" role="status">正在读取文章库…</p></div>
+          <p id="public-note" class="saved-note" hidden></p>
+        </div>
+        <div class="header-actions">
+          <button id="public-history" class="quiet-button" type="button" hidden>拉取历史文章</button>
+          <button id="public-edit" class="quiet-button" type="button" hidden>编辑</button>
+          <button id="public-remove" class="quiet-button remove-link" type="button" hidden>移除</button>
+          <button id="public-remonitor" class="quiet-button" type="button" hidden>重新监控</button>
+          <button id="public-add" class="primary-button" type="button"><span class="plus-icon" aria-hidden="true"></span>添加公众号</button>
+        </div>
+      </header>
+      <details id="public-tasks" class="crawl-panel">
+        <summary><strong>文章采集任务</strong><span id="public-task-summary"></span></summary>
+        <div class="crawl-content">
+          <form id="public-schedule" class="schedule-form">
+            <label class="schedule-switch"><input id="public-enabled" type="checkbox"> 定时采集新增文章</label>
+            <label class="schedule-start">首次运行（北京时间）<input id="public-start" type="datetime-local" min="1970-01-01T08:00" max="9999-12-31T23:59" required></label>
+            <label class="schedule-period">间隔（至少 1 小时）<input id="public-interval" type="number" min="60" step="1" required> 分钟</label>
+            <button id="public-save" class="quiet-button" type="submit" disabled>保存设置</button>
+          </form>
+          <p id="public-next" class="crawl-hint"></p>
+          <h2 class="field-label">最近任务</h2>
+          <ul id="public-jobs" class="crawl-jobs"></ul>
+        </div>
+      </details>
+      <p id="public-error" class="inline-error" role="alert" hidden></p>
+      <section aria-label="已保存文章">
+        <div class="toolbar">
+          <label class="search"><span class="search-icon" aria-hidden="true"></span>
+            <input id="public-query" type="search" maxlength="256" placeholder="搜索文章或公众号" aria-label="搜索文章或公众号" autocomplete="off">
+          </label>
+          <div class="toolbar-actions">
+            <label class="sort"><span class="sort-icon" aria-hidden="true"><i></i></span>
+              <select id="public-sort" aria-label="文章排序">
+                <option value="newest">最新发布</option><option value="oldest">最早发布</option><option value="title">标题排序</option>
+              </select>
+              <span class="chevron" aria-hidden="true"></span>
+            </label>
+            <button id="public-refresh" class="icon-button" type="button" title="刷新文章库" aria-label="刷新文章库"><span class="refresh-icon" aria-hidden="true">↻</span></button>
+          </div>
+        </div>
+        <ul id="public-articles" class="public-articles"></ul>
+        <div id="public-empty" class="empty-state" hidden>
+          <h2 id="public-empty-title"></h2><p id="public-empty-hint"></p>
+          <button id="public-clear-search" class="quiet-button" type="button" hidden>清除搜索</button>
+        </div>
+        <div id="public-pages" class="public-pages" hidden>
+          <button id="public-prev" class="quiet-button" type="button">上一页</button>
+          <span id="public-page" class="summary"></span>
+          <button id="public-next-page" class="quiet-button" type="button">下一页</button>
+        </div>
+      </section>
+    </main>
+
+    <main id="account-directory" class="main" tabindex="-1" aria-labelledby="account-directory-title" hidden>
+      <header class="page-header">
+        <h1 id="account-directory-title" tabindex="-1"></h1>
+        <button id="directory-add-account" class="primary-button" type="button"><span class="plus-icon" aria-hidden="true"></span><span id="directory-add-label"></span></button>
+      </header>
+      <div class="toolbar directory-filters">
+        <div class="directory-scopes" role="group" aria-label="账号状态">
+          <button id="directory-monitored" type="button" aria-pressed="true">监控中 <span class="directory-scope-count"></span></button>
+          <button id="directory-archived" type="button" aria-pressed="false">历史账号 <span class="directory-scope-count"></span></button>
+        </div>
+        <label class="search"><span class="search-icon" aria-hidden="true"></span>
+          <input id="directory-query" type="search" maxlength="256" placeholder="搜索账号名称或备注" aria-label="搜索账号名称或备注" autocomplete="off">
+        </label>
+      </div>
+      <p id="directory-loading" class="summary" role="status" hidden>正在读取账号名单…</p>
+      <div id="account-directory-error" class="inline-error directory-error" role="alert" hidden>
+        <span id="directory-error-text"></span><button id="directory-retry" type="button" class="quiet-button">重试</button>
+      </div>
+      <ul id="directory-accounts" class="directory-account-list" aria-label="账号名单" hidden></ul>
+      <div id="directory-empty" class="empty-state" hidden>
+        <h2 id="directory-empty-title"></h2>
+        <button id="directory-clear" type="button" class="quiet-button" hidden>清除搜索</button>
+      </div>
+    </main>
+
+    <main id="settings" class="main" tabindex="-1" hidden>
+      <header class="page-header">
+        <h1>设置</h1>
+      </header>
+      <div class="settings-content">
+        <p id="settings-loading" class="settings-hint" role="status" hidden>正在读取设置…</p>
+        <p id="settings-load-error" class="inline-error" role="alert" hidden></p>
+        <button id="retry-settings" class="quiet-button" type="button" hidden>重新读取</button>
+        <form id="settings-form" autocomplete="off" hidden>
+          <fieldset id="settings-fields" class="settings-fields" disabled>
+            <section class="settings-card" aria-labelledby="storage-settings-title">
+              <h2 id="storage-settings-title">视频存储</h2>
+              <div class="settings-field">
+                <label class="field-label" for="storage-path">存储目录</label>
+                <div class="storage-path-row">
+                  <input class="text-field" id="storage-path" name="storage_path" type="text" maxlength="1024" required
+                    autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="storage-hint settings-storage-root">
+                  <button id="browse-storage" class="quiet-button" type="button" aria-haspopup="dialog">浏览目录</button>
+                </div>
+                <p class="settings-hint" id="storage-hint">浏览已有目录，或输入存储根目录下的绝对路径。下一次新录制使用所选目录，已有视频继续从原位置播放。</p>
+              </div>
+              <dl class="settings-facts">
+                <div id="settings-storage-root"><dt>存储根目录</dt><dd id="settings-root-value"></dd></div>
+                <div><dt>剩余空间</dt><dd id="settings-space-value"></dd></div>
+              </dl>
+            </section>
+            <section class="settings-card" aria-labelledby="model-settings-title">
+              <div>
+                <h2 id="model-settings-title">视频解析模型</h2>
+                <p class="settings-hint">打开已保存的视频即可提交解析任务，后台进程使用此处的模型连接。</p>
+              </div>
+              <div class="settings-field">
+                <label class="field-label" for="model-api-url">API URL</label>
+                <input class="text-field" id="model-api-url" name="model_api_url" type="url" maxlength="1024" placeholder="https://api.example.com/v1"
+                  autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="model-url-hint">
+                <p class="settings-hint" id="model-url-hint">填写模型服务的 API 基础地址。</p>
+              </div>
+              <div class="settings-field">
+                <label class="field-label" for="model-name">模型名称</label>
+                <input class="text-field" id="model-name" name="model_name" type="text" maxlength="200" autocomplete="off"
+                  autocapitalize="off" spellcheck="false" aria-describedby="model-name-hint">
+                <p class="settings-hint" id="model-name-hint">填写模型服务提供的模型 ID。</p>
+              </div>
+              <div class="settings-field">
+                <label class="field-label" for="model-api-key">API Key</label>
+                <input class="text-field" id="model-api-key" name="model_api_key" type="password" maxlength="1024"
+                  autocomplete="new-password" autocapitalize="off" spellcheck="false" aria-describedby="model-key-hint">
+                <p class="settings-hint" id="model-key-hint"></p>
+                <label id="clear-model-key-option" class="settings-checkbox" hidden><input id="clear-model-key" type="checkbox"> 保存时清除 API Key</label>
+              </div>
+            </section>
+            <div class="settings-actions">
+              <button id="save-settings" class="primary-button" type="submit" disabled>保存设置</button>
+              <p id="settings-status" class="settings-hint" role="status"></p>
+            </div>
+            <p id="settings-error" class="inline-error" role="alert" hidden></p>
+          </fieldset>
+        </form>
+        <section class="settings-card settings-shortcut" aria-labelledby="crawl-settings-title">
+          <div>
+            <h2 id="crawl-settings-title">采集计划</h2>
+            <p class="settings-hint">管理定时开关、首次运行时间和采集间隔。</p>
+          </div>
+          <a href="#crawl-panel" id="open-crawl-settings" class="quiet-button">前往采集设置</a>
+        </section>
+      </div>
+    </main>
+
+    <main id="logs" class="main" tabindex="-1" hidden>
+      <header class="page-header"><h1>日志</h1></header>
+      <div class="logs-content">
+        <form id="log-filters" class="log-filters">
+          <fieldset class="log-categories">
+            <legend class="field-label">功能</legend>
+            <div class="log-options">
+              <label><input type="radio" name="log-category" value="all" checked><span>全部</span></label>
+              <label><input type="radio" name="log-category" value="system"><span>系统与部署</span></label>
+              <label><input type="radio" name="log-category" value="crawl"><span>视频采集</span></label>
+              <label><input type="radio" name="log-category" value="search"><span>账号搜索</span></label>
+            </div>
+          </fieldset>
+          <div class="log-filter-row">
+            <div>
+              <label for="log-range" class="field-label">时间范围</label>
+              <select id="log-range" class="text-field">
+                <option value="3600">最近 1 小时</option>
+                <option value="86400" selected>最近 24 小时</option>
+                <option value="604800">最近 7 天</option>
+                <option value="custom">自定义</option>
+              </select>
+            </div>
+            <fieldset id="log-custom" class="log-custom" aria-label="自定义时段（北京时间）" disabled hidden>
+              <div>
+                <label for="log-start" class="field-label">开始时间</label>
+                <input id="log-start" class="text-field" type="datetime-local" min="1970-01-01T08:00" max="9999-12-31T23:59" required>
+              </div>
+              <div>
+                <label for="log-end" class="field-label">结束时间</label>
+                <input id="log-end" class="text-field" type="datetime-local" min="1970-01-01T08:00" max="9999-12-31T23:59" required>
+              </div>
+            </fieldset>
+            <button type="submit" class="quiet-button">查询日志</button>
+          </div>
+        </form>
+        <div class="log-result-meta">
+          <p id="log-status" class="summary" role="status"></p>
+          <span>北京时间</span>
+        </div>
+        <p id="log-error" class="inline-error" role="alert" hidden></p>
+        <ol id="log-entries" class="log-entries" aria-label="日志记录" hidden></ol>
+      </div>
+    </main>
   </div>
+
+  <dialog id="public-history-dialog" class="author-dialog" aria-labelledby="public-history-title">
+    <div class="dialog-titlebar"><h2 id="public-history-title">拉取历史文章</h2><button class="close-button" type="button" aria-label="关闭" data-close="public-history-dialog"></button></div>
+    <form id="public-history-form" class="public-dialog-form">
+      <p id="public-history-account" class="dialog-intro"></p>
+      <label for="public-limit" class="field-label public-limit-label">历史列表读取屏数</label>
+      <input id="public-limit" class="text-field" type="number" min="1" step="1" max="100000" placeholder="留空拉取全部；跨屏推送会收齐">
+      <p id="public-history-error" class="inline-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" class="quiet-button" data-close="public-history-dialog">取消</button>
+        <button id="public-run" class="primary-button" type="submit">开始拉取</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="public-reader" class="public-reader" aria-labelledby="public-reader-title">
+    <div class="dialog-titlebar"><h2 id="public-reader-title"></h2><button class="close-button" type="button" aria-label="关闭文章" data-close="public-reader"></button></div>
+    <div class="public-byline"><span id="public-reader-meta"></span><a id="public-source" class="saved-profile" target="_blank" rel="noopener noreferrer" hidden>查看微信原文</a></div>
+    <p id="public-reader-error" class="inline-error" role="alert" hidden></p>
+    <div id="public-body" class="public-body"></div>
+  </dialog>
+
+  <dialog id="directory-dialog" class="directory-dialog" aria-labelledby="directory-title">
+    <div class="dialog-titlebar">
+      <h2 id="directory-title">选择存储目录</h2>
+      <button class="close-button" type="button" aria-label="关闭" data-close="directory-dialog"></button>
+    </div>
+    <nav aria-label="目录路径"><ol id="directory-breadcrumbs" class="directory-breadcrumbs" hidden></ol></nav>
+    <p id="directory-location" class="directory-location" tabindex="-1" hidden></p>
+    <div class="directory-toolbar">
+      <button id="directory-parent" class="quiet-button" type="button" disabled>上一级</button>
+      <input id="directory-filter" class="text-field" type="search" aria-label="筛选当前目录" placeholder="筛选当前目录"
+        autocomplete="off" spellcheck="false" disabled>
+    </div>
+    <p id="directory-note" class="settings-hint" role="status" hidden></p>
+    <p id="directory-status" class="settings-hint" role="status"></p>
+    <p id="directory-error" class="inline-error" role="alert" hidden></p>
+    <button id="retry-directory" class="quiet-button" type="button" hidden>重新读取</button>
+    <ul id="directory-items" class="directory-items" aria-label="子目录" hidden></ul>
+    <div class="dialog-actions">
+      <button class="quiet-button" type="button" data-close="directory-dialog">取消</button>
+      <button id="select-directory" class="primary-button" type="button" disabled>选择此目录</button>
+    </div>
+  </dialog>
 
   <dialog id="edit-dialog" class="author-dialog" aria-labelledby="edit-title">
     <div class="dialog-titlebar">
@@ -117,6 +379,7 @@
             <strong id="edit-account-name"></strong>
             <button id="choose-replacement" class="link-profile" type="button">更换账号</button>
           </div>
+          <p id="edit-account-subject" class="account-description" hidden></p>
           <a id="edit-profile-url" class="saved-profile edit-url" target="_blank" rel="noopener noreferrer" hidden></a>
         </div>
         <div>
@@ -150,7 +413,7 @@
       <h2 id="author-dialog-title">添加监控视频号</h2>
       <button class="close-button" type="button" aria-label="关闭" data-close="author-dialog"></button>
     </div>
-    <p class="dialog-intro">用微信搜索账号，选择要监控的视频号。主页链接可在微信内打开。</p>
+    <p id="author-search-help" class="dialog-intro">用微信搜索账号，选择要监控的视频号。主页链接可在微信内打开。</p>
     <form id="author-search-form">
       <label for="author-name" class="field-label">视频号名称</label>
       <div class="author-search-row">
@@ -176,8 +439,26 @@
       <div><h2 id="playing-title"></h2><p id="playing-meta"></p></div>
       <button class="close-button" type="button" aria-label="关闭播放器" data-close="player-dialog"></button>
     </div>
-    <video id="player" controls playsinline preload="metadata"></video>
-    <p id="player-error" class="inline-error" role="alert" hidden>视频暂时无法播放，请检查外置盘上的文件后重试。</p>
+    <div class="player-views" role="group" aria-label="作品详情">
+      <button class="quiet-button" id="player-view-media" type="button" aria-controls="player-media" aria-pressed="true">视频</button>
+      <button class="quiet-button" id="player-view-analysis" type="button" aria-controls="video-analysis" aria-pressed="false">视频解析</button>
+    </div>
+    <div id="player-media">
+      <video id="player" controls playsinline preload="metadata"></video>
+      <p id="player-error" class="inline-error" role="alert" hidden>视频暂时无法播放，请检查外置盘上的文件后重试。</p>
+    </div>
+    <section class="video-analysis" id="video-analysis" aria-labelledby="video-analysis-title" hidden>
+      <div class="video-analysis-head">
+        <div>
+          <h3 id="video-analysis-title">视频解析</h3>
+          <p id="video-analysis-status" role="status"></p>
+        </div>
+        <button class="quiet-button" id="video-analysis-action" type="button" hidden></button>
+      </div>
+      <progress id="video-analysis-progress" aria-label="视频解析进度" hidden></progress>
+      <p class="inline-error" id="video-analysis-error" role="alert" hidden></p>
+      <div class="video-analysis-result" id="video-analysis-result" hidden></div>
+    </section>
   </dialog>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 </body>

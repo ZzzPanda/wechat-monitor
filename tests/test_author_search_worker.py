@@ -8,7 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, call, patch
 import uuid
 
 root = Path(__file__).resolve().parents[1]
@@ -60,6 +60,22 @@ class SearchWorkerTests(unittest.TestCase):
         self.assertIn('超时', self.reply(self.submit(ttl=-1))['error'])
         self.assertIn('格式', self.reply(self.submit('foo\nbar'))['error'])
         self.search.assert_not_called()
+
+    def test_search_events_count_results_without_recording_private_details(self):
+        probe = uuid.uuid4().hex + '.json'
+        (self.requests/probe).write_text(json.dumps({'q': '部署检查', 'expires': 0}))
+        self.search.side_effect = [
+            [{'name': 'fixture-account', 'url': 'https://example.com/private'}],
+            RuntimeError('nonpublic-provider-detail'),
+        ]
+        with patch('author_search_worker.write_event') as record:
+            self.reply(probe)
+            self.reply(self.submit('fixture-query'))
+            self.reply(self.submit('fixture-query'))
+        self.assertEqual(record.call_args_list, [
+            call(self.root, 'search', 'info', '微信搜索完成，返回 1 个候选账号。'),
+            call(self.root, 'search', 'error', '微信搜索未能完成。'),
+        ])
 
     def test_caller_deadline_interrupts_search_and_releases_player(self):
         def capture(query):

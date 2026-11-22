@@ -14,18 +14,27 @@ import sys
 
 sys.dont_write_bytecode = True
 from wechat_preview import DATABASE, ROOT, SHARE_URL
+from wechat_settings import (
+    DEFAULT_STORAGE_PATH, SETTINGS_FILENAME, STORAGE_ROOT, indexed_path, read_settings, resolve_storage_path,
+)
 
 
-MEDIA = ROOT / "media" / "微信视频号"
+MEDIA = DEFAULT_STORAGE_PATH
+SETTINGS_FILE = ROOT / "state" / "monitoring" / SETTINGS_FILENAME
 SOURCE = "wechat-playback-recording"
 
 
 def media_path(value):
-    base = MEDIA.resolve()
-    path = (base / value).resolve()
-    if not path.is_relative_to(base):
-        raise ValueError("file must be inside media/微信视频号")
-    return path
+    return indexed_path(STORAGE_ROOT, MEDIA, str(value))
+
+
+def configured_destination(relative):
+    """Store the selected path once before a new recording starts."""
+    selected = read_settings(SETTINGS_FILE, default_storage_path=MEDIA)['storage_path']
+    folder = resolve_storage_path(selected, STORAGE_ROOT, STORAGE_ROOT)
+    if folder == MEDIA.resolve():
+        return relative.as_posix()
+    return './' + (folder.relative_to(STORAGE_ROOT.resolve()) / relative).as_posix()
 
 
 def verify_streams(path):
@@ -86,10 +95,21 @@ def entry(db, key):
 
 def register(db, url, value, replace):
     work_key(db, url)
+    value = str(value)
+    root = STORAGE_ROOT.resolve()
+    legacy = MEDIA.resolve()
+    if Path(value).is_absolute():
+        path = Path(value).resolve()
+        if path.is_relative_to(legacy):
+            value = path.relative_to(legacy).as_posix()
+        else:
+            value = './' + path.relative_to(root).as_posix()
     path = media_path(value)
     size, digest = file_signature(path, probe=True)
-    item = dict(path=path.relative_to(MEDIA.resolve()).as_posix(), size=size,
-                sha256=digest, source=SOURCE)
+    legacy_path = path.relative_to(legacy).as_posix() if path.is_relative_to(legacy) else None
+    root_path = './' + path.relative_to(root).as_posix()
+    index_path, alias = (root_path, legacy_path) if value.startswith('./') else (legacy_path, root_path)
+    item = dict(path=index_path, size=size, sha256=digest, source=SOURCE)
     with db:
         db.execute("BEGIN IMMEDIATE")
         key = work_key(db, url)
@@ -101,10 +121,14 @@ def register(db, url, value, replace):
             )
         """)
         old = entry(db, key)
+        if old and old['path'] == alias:
+            item['path'] = alias
         if old == item:
             return dict(status="already_registered", work_key=key, **old)
         if old and not replace:
             raise ValueError("another path or file digest is registered; review it before using --replace")
+        if alias and db.execute("SELECT 1 FROM recordings WHERE path=? AND work_key<>?", (alias, key)).fetchone():
+            raise ValueError("recording path is already assigned to another work")
         db.execute("""
             INSERT INTO recordings(work_key,path,size,sha256,source) VALUES (:work_key,:path,:size,:sha256,:source)
             ON CONFLICT(work_key) DO UPDATE SET path=excluded.path, size=excluded.size,
@@ -138,7 +162,8 @@ def main():
     sub.add_parser("lookup").add_argument("url")
     add = sub.add_parser("register")
     add.add_argument("url")
-    add.add_argument("file", help="recording path relative to media/微信视频号 (or absolute inside it)")
+    add.add_argument("file", type=Path,
+                     help="recording path relative to media/微信视频号, or an absolute path under media")
     add.add_argument("--source", choices=[SOURCE], required=True,
                      help="confirm this file was recorded from playback in WeChat")
     add.add_argument("--replace", action="store_true", help="replace a previously registered file after review")

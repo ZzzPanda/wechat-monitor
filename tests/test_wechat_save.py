@@ -31,7 +31,9 @@ class Saving(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(dir=preview.ROOT / 'tmp', prefix='save-regression-')
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        (self.root / 'media').mkdir()
+        self.media = self.root / 'media'
+        self.media.mkdir()
+        self.settings_path = self.root / 'settings.json'
         self.db = sqlite3.connect(':memory:')
         self.addCleanup(self.db.close)
         self.db.row_factory = sqlite3.Row
@@ -52,7 +54,13 @@ class Saving(unittest.TestCase):
         stack = ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(patch.dict(save.__globals__, STAGING=self.root / 'staging', STATE=self.root, take_from_player=take))
-        stack.enter_context(patch.object(recordings, 'MEDIA', self.root / 'media'))
+        stack.enter_context(patch.multiple(recordings, MEDIA=self.media / '微信视频号',
+                                           STORAGE_ROOT=self.media, SETTINGS_FILE=self.settings_path))
+
+    def select_storage(self, name):
+        folder = self.media / name
+        self.settings_path.write_text(json.dumps({'storage_path': str(folder)}), encoding='utf-8')
+        return folder
 
     def test_resume_after_publish_and_after_repair(self):
         # Both a new file and a previously missing registered file can crash after link(), before SQL commit.
@@ -61,11 +69,18 @@ class Saving(unittest.TestCase):
         with patch.object(recordings, 'register', side_effect=RuntimeError('simulated crash')):
             with self.assertRaisesRegex(RuntimeError, 'simulated crash'):
                 save(self.db, first_url, self.item)
+        journal = self.root / 'staging' / self.item['fingerprint'] / 'job.json'
+        old_state = json.loads(journal.read_text())
+        del old_state['destination']
+        journal.write_text(json.dumps(old_state))
+        selected = self.select_storage('new location')
         self.assertEqual(save(self.db, alias, self.item)['status'], 'saved')
         self.assertEqual(save(self.db, first_url, self.item)['status'], 'already_saved')
         self.assertEqual(self.starts, 1)
         record = recordings.lookup(self.db, first_url)
         destination = recordings.media_path(record['path'])
+        self.assertTrue(destination.is_relative_to(recordings.MEDIA))
+        self.assertFalse(selected.exists())
         destination.unlink()
         self.db.execute("UPDATE recordings SET sha256=?", ('f'*64,))
         self.db.commit()
@@ -81,6 +96,41 @@ class Saving(unittest.TestCase):
         with self.assertRaises(entry['SaveError']):
             save(self.db, first_url, self.item)
         self.assertEqual(destination.read_bytes(), b'changed after registration')
+
+    def test_custom_storage_remains_pinned_through_retry_and_repair(self):
+        initial = self.select_storage('微信视频号/项目归档/视频')
+        first_url, alias = self.urls
+        with patch.object(recordings, 'register', side_effect=RuntimeError('simulated crash')):
+            with self.assertRaisesRegex(RuntimeError, 'simulated crash'):
+                save(self.db, first_url, self.item)
+        [published] = initial.rglob('*.mp4')
+        selected = self.select_storage('new location')
+        self.assertEqual(save(self.db, alias, self.item)['status'], 'saved')
+        registered = recordings.lookup(self.db, first_url)
+        self.assertEqual(registered['status'], 'verified')
+        self.assertEqual(registered['path'], './' + published.relative_to(self.media).as_posix())
+        self.assertEqual(recordings.media_path(registered['path']), published)
+        self.assertFalse(selected.exists())
+        self.assertEqual(self.starts, 1)
+        self.assertEqual(recordings.register(self.db, alias, published, replace=False)['status'], 'already_registered')
+        other = 'https://weixin.qq.com/sph/different'
+        preview.record(self.db, other, dict(author='测试作者', published='2026-11-02',
+                                            caption='另一条作品', cover_sha256='2' * 64))
+        with self.assertRaisesRegex(ValueError, 'already assigned'):
+            recordings.register(self.db, other, published, replace=False)
+
+        create_poster = runpy.run_path(str(ROOT / 'deploy' / 'posters.py'))['create_poster']
+        cache = self.root / 'posters'
+        cache.mkdir()
+        key = self.item['fingerprint']
+        self.assertTrue(create_poster((key, registered['path'], registered['sha256'], registered['size']), self.media, cache))
+        self.assertTrue((cache / (key + '.jpg')).is_file())
+
+        published.unlink()
+        self.assertEqual(save(self.db, alias, self.item)['status'], 'saved')
+        self.assertTrue(published.is_file())
+        self.assertFalse(selected.exists())
+        self.assertEqual(self.starts, 2)
 
     def test_captured_checkpoint_uses_original_url_across_retry(self):
         import wechat_clip

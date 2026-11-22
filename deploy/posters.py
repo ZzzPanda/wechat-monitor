@@ -13,14 +13,15 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from wechat_paths import DATA_ROOT, check_drive
+from wechat_settings import DEFAULT_STORAGE_PATH, STORAGE_ROOT, indexed_path
 
 
 def create_poster(record, media, cache):
     key, relative, digest, size = record
     if not re.fullmatch(r'[0-9a-f]{64}', key):
         raise ValueError('invalid recording ID')
-    video = (media / relative).resolve(strict=True)
-    if not video.is_relative_to(media) or not video.is_file():
+    video = indexed_path(media, media / DEFAULT_STORAGE_PATH.name, relative)
+    if not video.is_file():
         raise ValueError('invalid recording path')
     stat = video.stat()
     if stat.st_size != size:
@@ -64,7 +65,7 @@ def main():
     if args.key and not re.fullmatch(r'[0-9a-f]{64}', args.key):
         parser.error('expected a 64-character recording ID')
     check_drive()
-    media = (DATA_ROOT / 'media/微信视频号').resolve()
+    media = STORAGE_ROOT.resolve()
     cache = (DATA_ROOT / 'state/posters').resolve()
     if not media.is_relative_to(DATA_ROOT) or not cache.is_relative_to(DATA_ROOT):
         raise ValueError('preview storage is outside the project')

@@ -15,6 +15,7 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
 
+from wechat_events import write_event
 from wechat_paths import DATA_ROOT, check_drive
 
 MONITORING = DATA_ROOT / 'state/monitoring'
@@ -24,6 +25,10 @@ ENDPOINT = 'http://127.0.0.1:33023/api/crawl-worker'
 
 class ServiceError(Exception):
     pass
+
+
+class RequestRejected(ServiceError):
+    """The dashboard rejected an item or its job changed during collection."""
 
 
 class Dashboard:
@@ -43,7 +48,8 @@ class Dashboard:
                 message = json.load(exc).get('error')
             except (ValueError, OSError):
                 message = ''
-            raise ServiceError(message or f'管理页响应 {exc.code}') from exc
+            error = RequestRejected if exc.code in (400, 404, 409, 413) else ServiceError
+            raise error(message or f'管理页响应 {exc.code}') from exc
         except (URLError, OSError, ValueError) as exc:
             raise ServiceError('采集管理页暂时无法连接。') from exc
 
@@ -180,6 +186,76 @@ def run_job(api, job, saver, db, discover):
     api('finish', id=job_id, status=status, error=message[:500])
 
 
+def run_public_job(api, job, discover, read_article):
+    job_id = job['id']
+    since = job.get('since')
+    cutoff = (datetime.fromtimestamp(since, timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
+              if since is not None else None)
+    saved_or_checked = failures = invalid_links = 0
+
+    def stopped():
+        return not api('public_active', id=job_id)['active']
+
+    def collect(url):
+        nonlocal saved_or_checked, failures, invalid_links
+        try:
+            published = api('public_skip_known', id=job_id, url=url)['published']
+        except RequestRejected:
+            failures += 1
+            invalid_links += 1
+            return False
+        if published:
+            saved_or_checked += 1
+            return bool(cutoff and published < cutoff)
+        try:
+            article = read_article(url)
+            if article['biz'] != job['account']['biz']:
+                raise ValueError('文章署名所属的公众号与所选账号不一致。')
+        except (RuntimeError, ValueError, OSError) as exc:
+            api('public_fail', id=job_id, url=url, error=str(exc)[:400])
+            failures += 1
+            return False
+        if stopped():
+            return False
+        older = bool(cutoff and article['published'] < cutoff)
+        try:
+            api('public_skip_before' if older else 'public_save', id=job_id, article=article)
+        except RequestRejected as exc:
+            if not stopped():
+                api('public_fail', id=job_id, url=url, error=str(exc)[:400])
+                failures += 1
+            return False
+        saved_or_checked += 1
+        return older
+
+    def yield_at(checkpoint):
+        return api('public_yield', id=job_id, checkpoint=checkpoint)['yielded']
+
+    try:
+        resume = {}
+        if job['mode'] == 'history' and not job.get('max_pages'):
+            resume = dict(checkpoint=job.get('checkpoint'), on_boundary=yield_at)
+        outcome = discover(job['account'], mode=job['mode'], on_article=collect,
+                           should_stop=stopped, max_pages=job.get('max_pages'), **resume)
+        if outcome.get('yielded') or stopped():
+            return
+        status = 'done' if outcome['complete'] and not failures else 'partial'
+        message = outcome.get('reason', '')
+        if invalid_links:
+            message += f'。{invalid_links} 个文章链接未通过校验。'
+    except RequestRejected as exc:
+        if stopped():
+            return
+        status, message = 'partial' if saved_or_checked or failures else 'failed', str(exc)
+    except ServiceError:
+        # The supervisor requeues a running job after a transport interruption.
+        raise
+    except Exception as exc:
+        status = 'partial' if saved_or_checked or failures else 'failed'
+        message = str(exc) or '公众号采集未完成。'
+    api('public_finish', id=job_id, status=status, error=message[:500])
+
+
 def run_one(api):
     # The single player stays on this author's grid between recordings.
     with try_lock(MONITORING / 'crawl-run.lock') as worker, try_lock(PLAYER_LOCK) as player:
@@ -189,6 +265,11 @@ def run_one(api):
         if not job:
             return
         try:
+            if job.get('source') == 'public':
+                from wechat_public_article import read_article
+                from wechat_public_discovery import crawl_public_account
+                run_public_job(api, job, crawl_public_account, read_article)
+                return
             from wechat_discovery import crawl_profile
             saver = runpy.run_path(str(Path(__file__).with_name('wechat-save')))
             saver['verify_disk']()
@@ -199,7 +280,8 @@ def run_one(api):
         except ServiceError:
             raise
         except Exception as exc:
-            api('finish', id=job['id'], status='failed', error=(str(exc) or '采集进程未能启动。')[:500])
+            op = 'public_finish' if job.get('source') == 'public' else 'finish'
+            api(op, id=job['id'], status='failed', error=(str(exc) or '采集进程未能启动。')[:500])
 
 
 def serve():
@@ -210,11 +292,14 @@ def serve():
         version = script.stat().st_ino
         child = None
         recover = True
+        unavailable = False
         api = Dashboard()
         while MONITORING.is_dir():
             try:
                 if child and child.poll() is not None:
                     recover = child.returncode != 0
+                    if recover:
+                        write_event(MONITORING, 'crawl', 'error', '采集工作进程异常退出，正在恢复任务队列。')
                     child = None
                 if not child and script.stat().st_ino != version:
                     os.execv(sys.executable, [sys.executable, '-B', str(script), '--serve'])
@@ -226,7 +311,15 @@ def serve():
                 queued = api('tick')['queued']
                 if queued and child is None and not recover:
                     child = subprocess.Popen([sys.executable, '-B', str(script), '--one'])
+                if unavailable:
+                    write_event(MONITORING, 'crawl', 'info', '采集调度已恢复。')
+                    unavailable = False
             except (ServiceError, OSError) as exc:
+                if not unavailable:
+                    message = ('采集进程暂时无法联系管理页，稍后重试。' if isinstance(exc, ServiceError)
+                               else '采集调度遇到本地文件或进程错误，稍后重试。')
+                    write_event(MONITORING, 'crawl', 'error', message)
+                    unavailable = True
                 print(str(exc), file=sys.stderr, flush=True)
             time.sleep(4)
 

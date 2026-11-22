@@ -20,6 +20,9 @@ from urllib.error import URLError
 from urllib.request import ProxyHandler, build_opener
 
 SOURCE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SOURCE/'scripts'))
+from wechat_events import write_event
+
 VOLUME = Path('/Volumes/ssd1')
 UUID = '854330B0-E6A8-4BB0-8D7D-767BBEA0AF36'
 APP = VOLUME / 'wechat-monitor'
@@ -62,7 +65,8 @@ def check_disk():
     for path in [APP, RUNTIME, APP/'cache', APP/'lima', APP/'media', APP/'state', APP/'tmp',
                  APP/'scripts', APP/'tests', APP/'config', APP/'images', APP/'state/wechat-pilot',
                  APP/'state/monitoring', APP/'state/monitoring/search-requests',
-                 APP/'state/monitoring/search-replies', APP/'state/posters', APP/'state/dashboard-app']:
+                 APP/'state/monitoring/search-replies', APP/'state/posters', APP/'state/dashboard-app',
+                 APP/'state/video-analysis', RUNTIME/'video-analysis']:
         resolved = path.resolve()
         existing = next(p for p in (resolved, *resolved.parents) if p.exists())
         if not resolved.is_relative_to(VOLUME) or existing.stat().st_dev != VOLUME.stat().st_dev:
@@ -173,11 +177,16 @@ def install_authors():
 def install_dashboard_files(deploy):
     runtime = APP/'state/dashboard-app'
     source = SOURCE/'dashboard'
-    assets = [source/'server.py', source/'account_search.py', source/'crawl_queue.py',
-              *sorted(p for p in (source/'static').rglob('*') if p.is_file())]
+    assets = {asset.relative_to(source): asset for asset in (
+        source/'server.py', source/'account_search.py', source/'crawl_queue.py',
+        source/'public_articles.py', source/'public_routes.py',
+        source/'video_analysis_queue.py', source/'video_analysis_routes.py',
+        *sorted(p for p in (source/'static').rglob('*') if p.is_file()),
+    )}
+    for module in ('wechat_settings.py', 'wechat_events.py'):
+        assets[Path(module)] = SOURCE/'scripts'/module
     revision = hashlib.sha256()
-    for asset in assets:
-        name = asset.relative_to(source)
+    for name, asset in assets.items():
         revision.update(name.as_posix().encode() + b'\0' + bytes.fromhex(digest(asset)))
         copy_file(asset, runtime/name)
     (APP/'state/posters').mkdir(mode=0o700, exist_ok=True)
@@ -243,6 +252,27 @@ def start_crawl_worker():
             pass
         time.sleep(.4)
     raise RuntimeError(f'定时采集进程未就绪，请查看 {monitoring}/crawl-worker.log。')
+
+
+def start_video_analysis_worker():
+    monitoring = APP/'state/monitoring'
+    key = monitoring/'video-analysis-worker.key'
+    if not key.exists():
+        with tempfile.TemporaryDirectory(dir=monitoring) as stage:
+            pending = Path(stage)/key.name
+            pending.write_text(secrets.token_hex(32))
+            pending.chmod(0o600)
+            # Preserve the active worker's credential if two deployments overlap.
+            try:
+                os.link(pending, key)
+            except FileExistsError:
+                pass
+    for name in ('video_analysis_worker.py', 'video_analysis_probe.py'):
+        copy_file(SOURCE/'scripts'/name, APP/'scripts'/name)
+    command = [RUNTIME/'bin/wechat-python', '-B', APP/'scripts/video_analysis_worker.py']
+    with (monitoring/'video-analysis-worker.log').open('ab') as log:
+        subprocess.Popen(command, cwd='/', start_new_session=True, stdin=subprocess.DEVNULL,
+                         stdout=log, stderr=log, env=dict(os.environ, TMPDIR=str(APP/'tmp')))
 
 
 def start_vm():
@@ -320,23 +350,55 @@ def wait_for_desktop():
     raise RuntimeError('微信桌面、录制依赖或本机 33021 入口没有就绪；请检查 wx-playback 日志。')
 
 
+def dashboard_deployment():
+    deploy = RUNTIME/'deployment'
+    copy_file(SOURCE/'compose.yaml', deploy/'compose.yaml')
+    compose = [*DOCKER, 'compose', '-f', str(deploy/'compose.yaml')]
+    revision = install_dashboard_files(deploy)
+    env = dict(os.environ, WECHAT_MEDIA_DIR=str(APP/'media'), WECHAT_STATE_DIR=str(APP/'state'),
+               DASHBOARD_UID=str(os.getuid()), DASHBOARD_REVISION=revision)
+    run(*compose, 'config', '--quiet', env=env)
+    return deploy, compose, env
+
+
+def start_dashboard(compose, env):
+    run(*compose, 'up', '-d', '--no-build', '--no-deps', 'dashboard', env=env)
+    opener = build_opener(ProxyHandler({}))
+    for _ in range(30):
+        try:
+            with opener.open(DASHBOARD+'api/dashboard', timeout=2) as response:
+                library = json.load(response)
+            if isinstance(library.get('videos'), list) and isinstance(library.get('authors'), list):
+                return
+        except (URLError, OSError, ValueError):
+            pass
+        time.sleep(1)
+    raise RuntimeError('管理页未就绪，请检查 dashboard 容器及本机 33023 端口。')
+
+
 def main():
-    argparse.ArgumentParser(description=__doc__).parse_args()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--video-analysis-only', action='store_true',
+                        help='更新现有管理页并启动独立分析进程')
+    args = parser.parse_args()
     check_disk()
+    if args.video_analysis_only:
+        if not SOCKET.is_socket() or not (RUNTIME/'bin/wechat-python').is_file():
+            raise RuntimeError('请先完成管理页的一键部署。')
+        _, compose, env = dashboard_deployment()
+        prepare_image(compose, env, 'dashboard', 'dashboard')
+        start_dashboard(compose, env)
+        start_video_analysis_worker()
+        print('视频分析管理页：' + DASHBOARD)
+        return
     check_host()
     with install_lock():
         for folder in ('media','state','tmp','config'):
             (APP/folder).mkdir(mode=0o700, exist_ok=True)
         print('正在准备外置盘上的 Docker 引擎。', flush=True)
         start_vm()
-        deploy = RUNTIME/'deployment'
-        copy_file(SOURCE/'compose.yaml', deploy/'compose.yaml')
+        deploy, compose, env = dashboard_deployment()
         copy_file(SOURCE/'docker/Dockerfile',deploy/'docker/Dockerfile')
-        compose = [*DOCKER, 'compose','-f',str(deploy/'compose.yaml')]
-        revision = install_dashboard_files(deploy)
-        env = dict(os.environ, WECHAT_MEDIA_DIR=str(APP/'media'), WECHAT_STATE_DIR=str(APP/'state'),
-                   DASHBOARD_UID=str(os.getuid()), DASHBOARD_REVISION=revision)
-        run(*compose,'config','--quiet',env=env)
         status = existing_player()
         prepare_image(compose, env, 'player', 'weixin')
         prepare_image(compose, env, 'dashboard', 'dashboard')
@@ -351,22 +413,15 @@ def main():
         previews = subprocess.run([sys.executable, '-B', str(APP/'deploy/posters.py')])
         if previews.returncode:
             print('部分视频暂时没有封面，仍可在管理页查看作品。', file=sys.stderr)
-        run(*compose,'up','-d','--no-build','--no-deps','dashboard',env=env)
+        start_dashboard(compose, env)
         wait_for_desktop()
-        opener = build_opener(ProxyHandler({}))
-        for _ in range(30):
-            try:
-                with opener.open(DASHBOARD+'api/dashboard',timeout=2) as response:
-                    library = json.load(response)
-                if isinstance(library.get('videos'), list) and isinstance(library.get('authors'), list):
-                    break
-            except (URLError, OSError, ValueError):
-                pass
-            time.sleep(1)
-        else:
-            raise RuntimeError('管理页未就绪，请检查 dashboard 容器及本机 33023 端口。')
+        try:
+            start_video_analysis_worker()
+        except OSError as exc:
+            print(f'视频分析进程启动失败：{exc}', file=sys.stderr)
         start_search_worker()
         start_crawl_worker()
+        write_event(APP/'state/monitoring', 'system', 'info', '管理台部署完成，采集和账号搜索进程已就绪。')
         print('视频号管理页：' + DASHBOARD)
         print('微信桌面已就绪：' + DESKTOP)
         print('保存命令：' + str(APP/'wechat-save') + ' save <微信分享链接>')

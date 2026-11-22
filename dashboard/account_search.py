@@ -53,9 +53,10 @@ def profile_record(row):
 
 
 class DesktopSearch:
-    def __init__(self, folder, timeout=115):
+    def __init__(self, folder, timeout=115, kind='video'):
         self.folder = Path(folder)
         self.timeout = timeout
+        self.kind = kind
         self.lock = threading.Lock()
 
     def __call__(self, query):
@@ -69,7 +70,7 @@ class DesktopSearch:
             with tempfile.NamedTemporaryFile(dir=self.folder, delete=False, mode='w', encoding='utf-8') as out:
                 pending = Path(out.name)
                 try:
-                    json.dump(dict(q=query, expires=time.time() + self.timeout), out, ensure_ascii=False)
+                    json.dump(dict(q=query, kind=self.kind, expires=time.time() + self.timeout), out, ensure_ascii=False)
                     out.flush()
                     os.replace(pending, request)
                 finally:
@@ -102,8 +103,10 @@ class AccountSelections:
     cache_seconds = 600
     cache_limit = 64
 
-    def __init__(self, search):
+    def __init__(self, search, validate=profile_record, label='视频号'):
         self.search = search
+        self.validate = validate
+        self.label = label
         self.lock = threading.Lock()
         self.tokens = {}
         self.cache = {}
@@ -131,7 +134,7 @@ class AccountSelections:
         rows = self.search(query)
         accounts = {}
         for row in rows[:30]:
-            account = profile_record(row)
+            account = self.validate(row)
             if account is not None:
                 accounts.setdefault(account.get('id') or account['url'], account)
         if rows and not accounts:
@@ -151,4 +154,4 @@ class AccountSelections:
                 record = self.tokens.get(token)
                 if record and record[0] > time.monotonic():
                     return record[1]
-        raise ValueError('请选择本次搜索返回的视频号。选择已过期时请重新搜索。')
+        raise ValueError(f'请选择本次搜索返回的{self.label}。选择已过期时请重新搜索。')

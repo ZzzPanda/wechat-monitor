@@ -128,6 +128,34 @@ class Queue:
                          j.created_at DESC,j.rowid DESC""")
             return dict(settings=settings_row(db), jobs=[dict(r) for r in rows])
 
+    def log_entries(self, start, end, limit):
+        """Summarize existing completed jobs without exposing command output or share links."""
+        modes = {'history': '历史采集', 'incremental': '定时增量'}
+        outcomes = {'done': ('完成', 'info'), 'partial': ('部分完成', 'warning'),
+                    'cancelled': ('已取消', 'warning'), 'failed': ('失败', 'error')}
+        with self.db() as db:
+            rows = db.execute("""
+                WITH recent AS (
+                    SELECT rowid AS ordinal, id, author, mode, status, updated_at FROM jobs
+                    WHERE updated_at BETWEEN ? AND ? AND status IN ('done','partial','cancelled','failed')
+                    ORDER BY updated_at DESC, rowid DESC LIMIT ?
+                )
+                SELECT r.author, r.mode, r.status, r.updated_at,
+                       count(i.work_key) AS discovered,
+                       count(CASE WHEN i.status='saved' THEN 1 END) AS saved,
+                       count(CASE WHEN i.status='failed' THEN 1 END) AS failed
+                FROM recent r LEFT JOIN items i ON r.id=i.job_id
+                GROUP BY r.id ORDER BY r.updated_at DESC, r.ordinal DESC
+            """, (start, end, limit)).fetchall()
+        entries = []
+        for row in rows:
+            outcome, level = outcomes[row['status']]
+            author = ' '.join(row['author'].split())[:150]
+            message = (f'{author} · {modes.get(row["mode"], "视频采集")}{outcome}。'
+                       f'发现 {row["discovered"]} 条，保存 {row["saved"]} 条，失败 {row["failed"]} 条。')
+            entries.append(dict(time=row['updated_at'], category='crawl', level=level, message=message))
+        return entries
+
     def configure(self, enabled, interval_minutes, start_at=None):
         if type(enabled) is not bool or type(interval_minutes) is not int or interval_minutes < 60:
             raise ValueError('采集间隔须为整数分钟，最短 60 分钟。')
@@ -187,6 +215,13 @@ class Queue:
         with self.db() as db:
             return bool(db.execute("SELECT 1 FROM jobs WHERE status='queued' LIMIT 1").fetchone())
 
+    def next_queued(self):
+        with self.db() as db:
+            row = db.execute("""SELECT mode,created_at FROM jobs WHERE status='queued'
+                                ORDER BY CASE WHEN mode='incremental' THEN 0 ELSE 1 END,created_at,rowid
+                                LIMIT 1""").fetchone()
+            return dict(row) if row else None
+
     def is_running(self, job_id):
         with self.db() as db:
             return bool(db.execute("SELECT 1 FROM jobs WHERE id=? AND status='running'", (job_id,)).fetchone())
@@ -205,15 +240,15 @@ class Queue:
             waiting = row['mode'] == 'history' and bool(db.execute(QUEUED_INCREMENTAL).fetchone())
             return dict(active=True, yield_requested=waiting)
 
-    def yield_history(self, job_id, checkpoint):
+    def yield_history(self, job_id, checkpoint, external_incremental=False):
         if not isinstance(checkpoint, dict):
             raise ValueError('历史任务的断点格式无效。')
         cursor = json.dumps(checkpoint, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
         with self.db(write=True) as db:
             moved = db.execute(f"""UPDATE jobs SET status='queued',error=?,updated_at=?
                                    WHERE id=? AND mode='history' AND status='running'
-                                   AND EXISTS ({QUEUED_INCREMENTAL})""",
-                               ('等待定时增量完成后继续', int(time.time()), job_id))
+                                   AND (? OR EXISTS ({QUEUED_INCREMENTAL}))""",
+                               ('等待定时增量完成后继续', int(time.time()), job_id, external_incremental))
             if not moved.rowcount:
                 return False
             db.execute("""INSERT INTO history_checkpoints(job_id,cursor) VALUES(?,?)
@@ -228,7 +263,7 @@ class Queue:
             return job_row(db, job_id)
 
     def claim(self, entries):
-        tracked = {entry['name']: entry.get('url') for entry in entries}
+        tracked = {(entry['name'], entry.get('url')) for entry in entries}
         now = int(time.time())
         with self.db(write=True) as db:
             self._schedule_due(db, entries, now)
@@ -238,7 +273,7 @@ class Queue:
                                  ORDER BY CASE WHEN mode='incremental' THEN 0 ELSE 1 END,created_at,rowid""").fetchall()
             for row in rows:
                 job_id = row['id']
-                if not row['profile_url'] or tracked.get(row['author']) != row['profile_url']:
+                if not row['profile_url'] or (row['author'], row['profile_url']) not in tracked:
                     db.execute("UPDATE jobs SET status='cancelled',error=?,updated_at=? WHERE id=?",
                                ('监控名单中的账号已移除或更换。', now, job_id))
                     continue

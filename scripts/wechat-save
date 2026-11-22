@@ -22,11 +22,13 @@ sys.dont_write_bytecode = True
 import wechat_preview as preview
 import wechat_recording as recordings
 
+from wechat_events import write_event
 from wechat_paths import DATA_ROOT as ROOT, VOLUME, DISK_UUID, DOCKER_HOST
 
 AUTHORS = ROOT / 'config' / 'authors.txt'
 STATE = preview.DATABASE.parent
 STAGING = ROOT / 'tmp' / 'staging'
+MONITORING = ROOT / 'state' / 'monitoring'
 
 
 class SaveError(Exception):
@@ -40,7 +42,7 @@ def verify_disk():
     info = subprocess.run(['diskutil', 'info', '-plist', str(VOLUME)], capture_output=True, timeout=10)
     if info.returncode or plistlib.loads(info.stdout).get('VolumeUUID') != DISK_UUID:
         raise SaveError('disk_unavailable', '请挂载指定的 1 TB 外置盘 ssd1。')
-    for path in (ROOT, STATE, STAGING, recordings.MEDIA):
+    for path in (ROOT, STATE, STAGING, recordings.STORAGE_ROOT, recordings.MEDIA):
         resolved = path.resolve()
         existing = next(p for p in (resolved, *resolved.parents) if p.exists())
         if not resolved.is_relative_to(VOLUME) or existing.stat().st_dev != VOLUME.stat().st_dev:
@@ -442,7 +444,19 @@ def save(db, url, item, *, return_to_profile=True):
     ensure_directory(folder)
     if job:
         remove_partial_stages(folder)
-    destination = recordings.media_path(current.get('path') or new_destination(item))
+    registered_path = current.get('path')
+    saved_path = job.get('destination') if job else None
+    if job and 'destination' in job and (not isinstance(saved_path, str) or not saved_path
+                                         or (registered_path and registered_path != saved_path)):
+        raise SaveError('needs_review', '暂存录制与已登记的保存路径不一致。')
+    if registered_path or saved_path:
+        destination_path = registered_path or saved_path
+    elif job:
+        # Existing journals predate configurable storage and always used the original directory.
+        destination_path = new_destination(item).as_posix()
+    else:
+        destination_path = recordings.configured_destination(new_destination(item))
+    destination = recordings.media_path(destination_path)
     raw, clip = folder / 'raw.mp4', folder / 'clip.mp4'
     if destination.exists() and (not job or job['phase'] != 'ready'):
         raise SaveError('needs_review', f'目标路径已有未核对的文件：{destination}')
@@ -450,7 +464,8 @@ def save(db, url, item, *, return_to_profile=True):
     if job is None or job['phase'] == 'recording':
         if job is None and any(p.exists() for p in (raw, clip, folder / 'capture.mkv')):
             raise SaveError('needs_review', f'暂存目录中有来源待核对的文件：{folder}')
-        job = dict(version=1, key=key, phase='recording', url=url, repairing=current['status'] == 'missing')
+        job = dict(version=1, key=key, phase='recording', url=url,
+                   repairing=current['status'] == 'missing', destination=destination_path)
         write_journal(folder, job)
         raw.unlink(missing_ok=True)
         clip.unlink(missing_ok=True)
@@ -482,6 +497,8 @@ def save(db, url, item, *, return_to_profile=True):
         job.update(phase='ready', size=size, digest=digest)
         write_journal(folder, job)
     verify_disk()
+    if destination != recordings.media_path(destination_path):
+        raise SaveError('needs_review', '录制期间保存路径发生变化，请检查目标目录。')
     ensure_directory(destination.parent)
     if not destination.exists():
         if recordings.file_signature(clip) != (job['size'], job['digest']):
@@ -495,7 +512,7 @@ def save(db, url, item, *, return_to_profile=True):
     if recordings.file_signature(destination) != (job['size'], job['digest']):
         raise SaveError('needs_review', '目标文件与录制校验值不同。')
     progress('registering', file=str(destination))
-    result = recordings.register(db, url, str(destination), replace=bool(current['status'] == 'missing' or recovering_repair))
+    result = recordings.register(db, url, destination_path, replace=bool(current['status'] == 'missing' or recovering_repair))
     clean_stage(folder)
     return dict(result, status='saved', player_seconds=job['duration'],
                 clip_seconds=round(job['end'] - job['start'], 3))
@@ -505,6 +522,19 @@ def output(data):
     print(json.dumps(data, ensure_ascii=False), flush=True)
 
 
+def log_save_failure(status):
+    message = {
+        'busy': '微信播放器被占用，手动保存暂未开始。',
+        'disk_full': '外盘可用空间不足，手动保存失败。',
+        'disk_unavailable': '指定外置盘不可用，手动保存失败。',
+        'needs_player': '未能确认目标作品的微信播放器，手动保存失败。',
+        'runtime_unavailable': '微信录制环境不可用，手动保存失败。',
+        'interrupted': '手动保存已中断，可重新执行同一保存命令。',
+    }.get(status, '手动保存失败，命令输出包含详细原因。')
+    level = 'warning' if status in ('busy', 'interrupted') else 'error'
+    write_event(MONITORING, 'crawl', level, message)
+
+
 def update_poster(key):
     helper = ROOT / 'deploy/posters.py'
     if helper.is_file():
@@ -512,6 +542,7 @@ def update_poster(key):
             subprocess.run([sys.executable, '-B', str(helper), '--key', key], check=True,
                            stdout=subprocess.DEVNULL, timeout=60)
         except (OSError, subprocess.SubprocessError) as exc:
+            write_event(MONITORING, 'crawl', 'warning', '已保存作品的封面暂未生成。')
             progress('poster_unavailable', detail=str(exc))
 
 
@@ -547,11 +578,17 @@ def main():
                         result['file'] = str(recordings.media_path(result['path']))
                     if result['status'] == 'saved':
                         update_poster(result['work_key'])
+                        write_event(MONITORING, 'crawl', 'info', '已手动保存 1 条作品。')
+                    elif result['status'] == 'already_saved':
+                        write_event(MONITORING, 'crawl', 'info', '手动保存跳过了已保存的作品。')
                     output(dict(url=url, **result))
                     if result['status'] not in ('already_saved', 'saved', 'verified'):
                         result_code = max(result_code, 1)
                 except (ValueError, OSError, RuntimeError, sqlite3.Error, subprocess.SubprocessError, SaveError) as exc:
-                    output(dict(url=url, status=getattr(exc, 'status', 'failed'), error=str(exc)))
+                    status = getattr(exc, 'status', 'failed')
+                    if args.command == 'save':
+                        log_save_failure(status)
+                    output(dict(url=url, status=status, error=str(exc)))
                     result_code = max(result_code, getattr(exc, 'exit_code', 1))
     return result_code
 
@@ -564,8 +601,13 @@ if __name__ == '__main__':
     try:
         sys.exit(main())
     except (ValueError, OSError, RuntimeError, sqlite3.Error, subprocess.SubprocessError, SaveError) as exc:
-        output(dict(status=getattr(exc, 'status', 'failed'), error=str(exc)))
+        status = getattr(exc, 'status', 'failed')
+        if sys.argv[1:2] == ['save']:
+            log_save_failure(status)
+        output(dict(status=status, error=str(exc)))
         sys.exit(getattr(exc, 'exit_code', 1))
     except KeyboardInterrupt:
+        if sys.argv[1:2] == ['save']:
+            log_save_failure('interrupted')
         output(dict(status='interrupted', error='保存已中断。可用相同命令重试。'))
         sys.exit(130)

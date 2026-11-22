@@ -14,6 +14,7 @@ sys.path[:0] = [str(root/'dashboard' if (root/'dashboard/server.py').is_file() e
                 str(root/'scripts')]
 import crawl_worker
 from server import DashboardServer, Library
+from wechat_events import read_events
 import wechat_preview
 
 
@@ -92,6 +93,22 @@ class CrawlWorkerTests(unittest.TestCase):
 
         crawl_worker.run_job(self.api, job, self.saver, self.downloads, discover)
         return next(row for row in self.queue.snapshot()['jobs'] if row['id'] == job_id)
+
+    def test_service_logs_one_outage_and_recovery(self):
+        client = Mock(side_effect=[
+            {}, crawl_worker.ServiceError('private transport detail'),
+            crawl_worker.ServiceError('still unavailable'), {'queued': []},
+        ])
+        with patch.object(crawl_worker, 'Dashboard', return_value=client), \
+                patch.object(crawl_worker.time, 'sleep', side_effect=[None, None, InterruptedError]), \
+                patch('builtins.print'):
+            with self.assertRaises(InterruptedError):
+                crawl_worker.serve()
+        events = read_events(crawl_worker.MONITORING, 'crawl', 0, 2**63 - 1, 10)
+        self.assertEqual([(event['level'], event['message']) for event in events], [
+            ('info', '采集调度已恢复。'),
+            ('error', '采集进程暂时无法联系管理页，稍后重试。'),
+        ])
 
     def test_hourly_round_runs_between_two_history_saves_then_resumes_same_job(self):
         old, new, first, second = [self.share(key) for key in ('old', 'new', 'first', 'second')]
