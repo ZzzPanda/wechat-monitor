@@ -1,9 +1,23 @@
 #!/bin/sh
 set -eu
-app=/Volumes/ssd1/wechat-monitor
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+location=${WECHAT_CONFIG_DIR:-"$HOME/.config/wechat-monitor"}/location
+if [ -n "${WECHAT_DATA_ROOT:-}" ]; then
+    app=$WECHAT_DATA_ROOT
+elif [ -x "$here/runtime/bin/wechat-python" ]; then
+    app=$here
+elif [ -f "$location" ]; then
+    IFS= read -r app < "$location"
+elif [ -f /Volumes/ssd1/wechat-monitor/lima/wx/lima.yaml ]; then
+    app=/Volumes/ssd1/wechat-monitor
+else
+    app=$HOME/.wechat-monitor
+fi
 python="$app/runtime/bin/wechat-python"
 if [ ! -x "$python" ] || [ ! -f "$app/scripts/wechat-save" ]; then
-    echo '请先在源码目录运行 ./deploy.sh。' >&2
+    echo "请先运行 ./deploy.sh 或重新挂载数据盘：$app" >&2
     exit 1
 fi
+export WECHAT_DATA_ROOT="$app"
+export PATH="$app/runtime/bin:$PATH"
 exec "$python" -B "$app/scripts/wechat-save" "$@"

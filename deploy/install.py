@@ -1,4 +1,4 @@
-"""Deploy the M4 player and its host-side saving tools on the designated SSD."""
+"""在 Apple Silicon Mac 上安装本地微信采集环境。"""
 import argparse
 from contextlib import contextmanager
 import fcntl
@@ -7,10 +7,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import plistlib
 import shlex
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -22,16 +22,23 @@ from urllib.request import ProxyHandler, build_opener
 SOURCE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SOURCE/'scripts'))
 from wechat_events import write_event
+from wechat_paths import check_drive, child_on_drive, lima_home, place_vm_disk, prepare_vm_disk, resolve_root, save_selection
 
-VOLUME = Path('/Volumes/ssd1')
-UUID = '854330B0-E6A8-4BB0-8D7D-767BBEA0AF36'
-APP = VOLUME / 'wechat-monitor'
-RUNTIME = APP / 'runtime'
-SOCKET = APP / 'lima/wx/sock/docker.sock'
-DOCKER = ['docker', '--host', f'unix://{SOCKET}']
 IMAGES = json.loads((SOURCE/'deploy/images.lock.json').read_text())
-DESKTOP = 'http://127.0.0.1:33021/'
-DASHBOARD = 'http://127.0.0.1:33023/'
+DEFAULT_PORT = 33021
+
+
+def configure(root, port):
+    global APP, RUNTIME, SOCKET, DOCKER, DESKTOP, DASHBOARD
+    APP = root
+    RUNTIME = root / 'runtime'
+    SOCKET = lima_home(root) / 'wx/sock/docker.sock'
+    DOCKER = ['docker', '--host', f'unix://{SOCKET}']
+    DESKTOP = f'http://127.0.0.1:{port}/'
+    DASHBOARD = f'http://127.0.0.1:{port + 2}/'
+    os.environ.update(WECHAT_DATA_ROOT=str(root), WECHAT_PORT_BASE=str(port))
+
+
 GUEST_CHECK = """set -eu
 for cmd in ffmpeg ffprobe xdotool xprop xwininfo xsel pactl; do command -v "$cmd" >/dev/null; done
 python3 -c 'from PIL import Image; from ctypes import CDLL; CDLL("libX11.so.6")'
@@ -56,26 +63,51 @@ def digest(path):
     return result.hexdigest()
 
 
-def check_disk():
-    if sys.platform != 'darwin' or os.uname().machine != 'arm64':
-        raise RuntimeError('本部署入口适用于 Apple Silicon macOS。')
-    disk = plistlib.loads(run('diskutil', 'info', '-plist', VOLUME, stdout=subprocess.PIPE).stdout)
-    if disk.get('VolumeUUID') != UUID or disk.get('MountPoint') != str(VOLUME) or disk.get('Internal') is not False:
-        raise RuntimeError('请挂载项目指定的 1 TB 外置盘 ssd1。')
-    for path in [APP, RUNTIME, APP/'cache', APP/'lima', APP/'media', APP/'state', APP/'tmp',
-                 APP/'scripts', APP/'tests', APP/'config', APP/'images', APP/'state/wechat-pilot',
-                 APP/'state/monitoring', APP/'state/monitoring/search-requests',
-                 APP/'state/monitoring/search-replies', APP/'state/posters', APP/'state/dashboard-app',
-                 APP/'state/video-analysis', RUNTIME/'video-analysis']:
-        resolved = path.resolve()
-        existing = next(p for p in (resolved, *resolved.parents) if p.exists())
-        if not resolved.is_relative_to(VOLUME) or existing.stat().st_dev != VOLUME.stat().st_dev:
-            raise RuntimeError(f'项目路径不在外置盘上：{path}')
+def check_install_paths():
+    for name in ('runtime', 'cache', 'media', 'state', 'tmp', 'scripts', 'tests', 'config', 'images', 'lima', 'vm',
+                 'state/wechat-pilot', 'state/monitoring', 'state/posters', 'state/dashboard-app',
+                 'state/video-analysis', 'runtime/video-analysis'):
+        child_on_drive(APP, APP / name)
+    # Docker, Lima and the persistent author list use Unix links on this volume.
+    with tempfile.TemporaryDirectory(dir=APP) as stage:
+        sample = Path(stage) / 'file'
+        sample.touch()
+        try:
+            (sample.parent / 'symlink').symlink_to(sample.name)
+            os.link(sample, sample.parent / 'hardlink')
+        except OSError as exc:
+            raise RuntimeError(f'数据目录所在卷需要支持符号链接和硬链接，请选择 APFS 等本地卷：{APP}') from exc
+
+
+def port_base(root, requested):
+    saved = child_on_drive(root, root / 'config/port-base')
+    previous = int(saved.read_text().strip()) if saved.exists() else None
+    vm_exists = (lima_home(root) / 'wx/lima.yaml').is_file()
+    if previous is None and vm_exists:
+        # Installations created before configurable ports use the original forwards.
+        previous = DEFAULT_PORT
+    port = previous if previous is not None else DEFAULT_PORT
+    if requested is not None:
+        port = requested
+    if not 1024 <= port <= 65533:
+        raise ValueError('端口起点应为 1024 到 65533。')
+    if vm_exists and previous is not None and port != previous:
+        raise ValueError(f'此实例已使用端口 {previous}–{previous + 2}，请沿用原端口。')
+    return port
+
+
+def check_free_ports(port):
+    for number in range(port, port + 3):
+        with socket.socket() as probe:
+            try:
+                probe.bind(('127.0.0.1', number))
+            except OSError as exc:
+                raise RuntimeError(f'本机端口 {number} 被占用。新实例可通过 --port-base 选择另一组三个连续端口。') from exc
 
 
 @contextmanager
-def install_lock():
-    folder = APP / 'state/wechat-pilot'
+def install_lock(root):
+    folder = child_on_drive(root, root / 'state/wechat-pilot')
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (folder/'save.lock').open('a+b') as lock:
         try:
@@ -95,47 +127,20 @@ def copy_file(source, dest):
         os.replace(pending, dest)
 
 
-def check_host():
-    missing = [name for name in ('docker', 'ffmpeg', 'ffprobe', 'xcrun') if not shutil.which(name)]
-    if missing:
-        raise RuntimeError('Mac 缺少以下工具，请参阅 README：' + ', '.join(missing))
-    run('docker', 'compose', 'version', stdout=subprocess.DEVNULL)
-    if 'prescale' not in output('ffmpeg', '-hide_banner', '-h', 'bsf=setts', stderr=subprocess.STDOUT):
-        raise RuntimeError('请安装支持 setts/prescale 的 FFmpeg；本机验证版本为 8.1。')
-    chrome = Path('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')
-    if not os.access(chrome, os.X_OK) and not any(shutil.which(x) for x in ('chromium','google-chrome')):
-        raise RuntimeError('请先安装 Google Chrome 或 Chromium，供保存工具核对微信分享页面。')
-
-
-def install_host():
+def install_host(interpreter):
     dest = RUNTIME / 'bin'
     dest.mkdir(exist_ok=True, parents=True)
-    venv = RUNTIME / 'save-venv'
-    check = 'from numpy import asarray; from PIL import Image'
-    candidates = [venv / 'bin/python3', Path(sys.executable)]
-    interpreter = next((p for p in candidates if p.is_file() and subprocess.run(
-        [str(p), '-B', '-c', check], capture_output=True).returncode == 0), None)
-    if interpreter is None:
-        run(sys.executable, '-m', 'venv', venv)
-        interpreter = candidates[0]
-        run(interpreter, '-m', 'pip', 'install', '--only-binary=:all:', '--cache-dir', APP/'cache/pip',
-            '-r', SOURCE/'requirements.txt', env=dict(os.environ, TMPDIR=str(APP/'tmp')))
+    # Jobs and direct wechat-save invocations must use the same tools as the installer.
     with tempfile.TemporaryDirectory(dir=dest) as stage:
-        pending = Path(stage) / 'python'
-        pending.write_text('#!/bin/sh\nexec ' + shlex.quote(str(interpreter)) + ' "$@"\n')
+        pending = Path(stage) / 'wechat-python'
+        pending.write_text(
+            '#!/bin/sh\nexport WECHAT_DATA_ROOT=' + shlex.quote(str(APP)) +
+            '\nexport WECHAT_PORT_BASE=' + shlex.quote(os.environ['WECHAT_PORT_BASE']) +
+            '\nexport DOCKER_CONFIG=' + shlex.quote(str(RUNTIME / 'docker-config')) +
+            '\nexport PATH=' + shlex.quote(str(dest)) + ':"$PATH"\nexec ' +
+            shlex.quote(str(interpreter)) + ' "$@"\n')
         pending.chmod(0o755)
-        os.replace(pending, dest/'wechat-python')
-    swift = SOURCE / 'scripts/wechat_visible_text.swift'
-    ocr = dest/'wechat-visible-text-stdin'
-    stamp = dest/'wechat-ocr-source.sha256'
-    sha = digest(swift)
-    if not os.access(ocr, os.X_OK) or not stamp.is_file() or stamp.read_text().strip() != sha:
-        with tempfile.TemporaryDirectory(dir=dest) as stage:
-            build = Path(stage)/ocr.name
-            run('xcrun', 'swiftc', '-O', '-module-cache-path', APP/'tmp/swift-cache', swift, '-o', build,
-                env=dict(os.environ, TMPDIR=str(APP/'tmp')))
-            os.replace(build, ocr)
-        stamp.write_text(sha+'\n')
+        os.replace(pending, dest / pending.name)
     for folder in ('scripts','tests'):
         for src in (SOURCE/folder).iterdir():
             if src.is_file() and not src.name.startswith('.'):
@@ -150,7 +155,7 @@ def install_authors():
     # both the Mac saver and the Docker dashboard always read the same names.
     old = APP/'config/authors.txt'
     folder = APP/'state/monitoring'
-    folder.mkdir(mode=0o700, exist_ok=True)
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     authors = folder/'authors.txt'
     with (folder/'authors.txt.lock').open('a+b') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -159,7 +164,10 @@ def install_authors():
                 raise RuntimeError(f'作者名单链接指向意外位置或文件缺失：{old}')
             return
         if not authors.exists():
-            copy_file(old if old.is_file() else SOURCE/'config/authors.example.txt', authors)
+            if old.is_file():
+                copy_file(old, authors)
+            else:
+                authors.touch(mode=0o600)
         elif old.is_file():
             saved = authors.read_text().splitlines()
             missing = [line for line in old.read_text().splitlines() if line.strip() and line not in saved]
@@ -183,7 +191,7 @@ def install_dashboard_files(deploy):
         source/'video_analysis_queue.py', source/'video_analysis_routes.py',
         *sorted(p for p in (source/'static').rglob('*') if p.is_file()),
     )}
-    for module in ('wechat_settings.py', 'wechat_events.py'):
+    for module in ('wechat_settings.py', 'wechat_events.py', 'wechat_paths.py'):
         assets[Path(module)] = SOURCE/'scripts'/module
     revision = hashlib.sha256()
     for name, asset in assets.items():
@@ -278,11 +286,14 @@ def start_video_analysis_worker():
 def start_vm():
     run(sys.executable, '-B', SOURCE/'deploy/bootstrap-runtime.py', '--root', APP)
     lima = RUNTIME/'bin/limactl'
-    env = dict(os.environ, LIMA_HOME=str(APP/'lima'))
-    if not (APP/'lima/wx/lima.yaml').is_file():
+    env = dict(os.environ, LIMA_HOME=str(lima_home(APP)))
+    if not (lima_home(APP)/'wx/lima.yaml').is_file():
+        prepare_vm_disk(APP)
         run(lima, 'create', '--tty=false', '--name=wx', RUNTIME/'wx.yaml', env=env)
     state = json.loads(output(lima, 'list', '--json', 'wx', env=env))
     if state['status'] != 'Running':
+        place_vm_disk(APP)
+        check_free_ports(int(os.environ['WECHAT_PORT_BASE']))
         run(lima, 'start', '--tty=false', 'wx', env=env)
     with (SOURCE/'deploy/guest-swap.sh').open('rb') as script:
         run(lima, 'shell', '--workdir=/', 'wx', '--', 'sudo', '-n', 'sh', '-s', stdin=script, env=env)
@@ -290,10 +301,10 @@ def start_vm():
         if subprocess.run(DOCKER+['info'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
             return
         time.sleep(1)
-    raise RuntimeError('外盘 wx 虚拟机的 Docker 引擎未就绪。')
+    raise RuntimeError('wx 虚拟机的 Docker 引擎未就绪。')
 
 
-def prepare_image(compose, env, component, service):
+def prepare_image(env, component):
     spec = IMAGES[component]
     tag = spec['tag']
     archive = APP/'images'/spec['archive']
@@ -309,7 +320,13 @@ def prepare_image(compose, env, component, service):
         if output(*DOCKER, 'image', 'inspect', '--format', '{{.Id}}', tag) != spec['archive_image_id']:
             raise RuntimeError('导入后的镜像与仓库记录的镜像 ID 不一致。')
     else:
-        run(*compose, 'build', service, env=env)
+        from oci_cache import prepare
+        layout = prepare(spec['base'], APP / 'cache' / ('oci-' + component))
+        context = RUNTIME / 'deployment' / ('docker' if component == 'player' else 'dashboard')
+        # BuildKit reads the verified OCI blobs from this Mac, including across VM restarts.
+        run(*DOCKER, 'buildx', 'build', '--platform', spec['platform'], '--load', '--tag', tag,
+            '--build-arg', 'BASE_IMAGE=wm-verified-base',
+            '--build-context', f'wm-verified-base=oci-layout://{layout}:base', context, env=env)
     run(*DOCKER, 'image', 'inspect', tag, stdout=subprocess.DEVNULL)
 
 
@@ -347,7 +364,7 @@ def wait_for_desktop():
             except (URLError, OSError):
                 pass
         time.sleep(1)
-    raise RuntimeError('微信桌面、录制依赖或本机 33021 入口没有就绪；请检查 wx-playback 日志。')
+    raise RuntimeError('微信桌面、录制依赖或本机桌面入口没有就绪；请检查 wx-playback 日志。')
 
 
 def dashboard_deployment():
@@ -355,8 +372,15 @@ def dashboard_deployment():
     copy_file(SOURCE/'compose.yaml', deploy/'compose.yaml')
     compose = [*DOCKER, 'compose', '-f', str(deploy/'compose.yaml')]
     revision = install_dashboard_files(deploy)
-    env = dict(os.environ, WECHAT_MEDIA_DIR=str(APP/'media'), WECHAT_STATE_DIR=str(APP/'state'),
-               DASHBOARD_UID=str(os.getuid()), DASHBOARD_REVISION=revision)
+    settings = dict(WECHAT_MEDIA_DIR=str(APP/'media'), WECHAT_STATE_DIR=str(APP/'state'),
+                    DASHBOARD_UID=str(os.getuid()), DASHBOARD_REVISION=revision)
+    # Compose loads this file even when invoked directly from another shell.
+    with tempfile.TemporaryDirectory(dir=deploy) as stage:
+        pending = Path(stage) / '.env'
+        pending.write_text(''.join(f'{key}={json.dumps(value.replace("$", "$$"), ensure_ascii=False)}\n'
+                                   for key, value in settings.items()))
+        os.replace(pending, deploy / '.env')
+    env = dict(os.environ, **settings)
     run(*compose, 'config', '--quiet', env=env)
     return deploy, compose, env
 
@@ -368,42 +392,68 @@ def start_dashboard(compose, env):
         try:
             with opener.open(DASHBOARD+'api/dashboard', timeout=2) as response:
                 library = json.load(response)
-            if isinstance(library.get('videos'), list) and isinstance(library.get('authors'), list):
+            with opener.open(DASHBOARD+'api/public', timeout=2) as response:
+                public = json.load(response)
+            with opener.open(DASHBOARD+'api/settings', timeout=2) as response:
+                storage = json.load(response).get('storage_root')
+            if storage is not None and storage != str(APP / 'media'):
+                raise RuntimeError('该端口对应其他数据目录的管理页，请核对本机端口。')
+            if (isinstance(library.get('videos'), list) and isinstance(library.get('authors'), list)
+                    and isinstance(public.get('accounts'), list) and storage == str(APP / 'media')):
                 return
         except (URLError, OSError, ValueError):
             pass
         time.sleep(1)
-    raise RuntimeError('管理页未就绪，请检查 dashboard 容器及本机 33023 端口。')
+    raise RuntimeError('管理页未就绪，请检查 dashboard 容器及管理页端口。')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--video-analysis-only', action='store_true',
                         help='更新现有管理页并启动独立分析进程')
+    parser.add_argument('--data-dir', type=Path, help='实例数据目录，支持本机磁盘和已挂载外盘')
+    parser.add_argument('--port-base', type=int, default=os.getenv('WECHAT_PORT_BASE'),
+                        help='本机三个连续端口的起点，默认 33021')
     args = parser.parse_args()
-    check_disk()
-    if args.video_analysis_only:
-        if not SOCKET.is_socket() or not (RUNTIME/'bin/wechat-python').is_file():
-            raise RuntimeError('请先完成管理页的一键部署。')
-        _, compose, env = dashboard_deployment()
-        prepare_image(compose, env, 'dashboard', 'dashboard')
-        start_dashboard(compose, env)
-        start_video_analysis_worker()
-        print('视频分析管理页：' + DASHBOARD)
-        return
-    check_host()
-    with install_lock():
-        for folder in ('media','state','tmp','config'):
-            (APP/folder).mkdir(mode=0o700, exist_ok=True)
-        print('正在准备外置盘上的 Docker 引擎。', flush=True)
+    if sys.platform != 'darwin' or os.uname().machine != 'arm64':
+        raise RuntimeError('本安装器适用于 Apple Silicon macOS。')
+    root = resolve_root(args.data_dir)
+    check_drive(root, initialize=not args.video_analysis_only)
+    with install_lock(root):
+        port = port_base(root, args.port_base)
+        configure(root, port)
+        check_install_paths()
+        for folder in ('media', 'state', 'tmp', 'config'):
+            (APP / folder).mkdir(mode=0o700, exist_ok=True)
+        from host_tools import prepare_host
+        if args.video_analysis_only:
+            if not SOCKET.is_socket() or not (RUNTIME/'bin/wechat-python').is_file():
+                raise RuntimeError('请先完成管理页的一键部署。')
+            prepare_host(APP)
+            _, compose, env = dashboard_deployment()
+            prepare_image(env, 'dashboard')
+            start_dashboard(compose, env)
+            start_video_analysis_worker()
+            print('视频分析管理页：' + DASHBOARD)
+            return
+        if not SOCKET.is_socket():
+            check_free_ports(port)
+        port_file = APP / 'config/port-base'
+        if not port_file.exists() or port_file.read_text().strip() != str(port):
+            with tempfile.TemporaryDirectory(dir=port_file.parent) as stage:
+                pending = Path(stage) / 'ports'
+                pending.write_text(str(port) + '\n')
+                os.replace(pending, port_file)
+        interpreter = prepare_host(APP)
+        print('正在准备此实例的 Docker 引擎。', flush=True)
         start_vm()
         deploy, compose, env = dashboard_deployment()
         copy_file(SOURCE/'docker/Dockerfile',deploy/'docker/Dockerfile')
         status = existing_player()
-        prepare_image(compose, env, 'player', 'weixin')
-        prepare_image(compose, env, 'dashboard', 'dashboard')
+        prepare_image(env, 'player')
+        prepare_image(env, 'dashboard')
         print('正在检查播放器镜像，安装保存工具和 OCR。', flush=True)
-        install_host()
+        install_host(interpreter)
         if status is None:
             run(*compose,'up','-d','--no-build','weixin',env=env)
         elif status in ('created','exited'):
@@ -422,6 +472,8 @@ def main():
         start_search_worker()
         start_crawl_worker()
         write_event(APP/'state/monitoring', 'system', 'info', '管理台部署完成，采集和账号搜索进程已就绪。')
+        save_selection(APP)
+        print('数据目录：' + str(APP))
         print('视频号管理页：' + DASHBOARD)
         print('微信桌面已就绪：' + DESKTOP)
         print('保存命令：' + str(APP/'wechat-save') + ' save <微信分享链接>')

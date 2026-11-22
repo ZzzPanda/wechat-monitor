@@ -23,7 +23,7 @@ from wechat_recording import file_signature
 from wechat_settings import SETTINGS_FILENAME, indexed_path, read_settings
 
 
-WORKER_ENDPOINT = 'http://127.0.0.1:33023/api/video-analysis-worker'
+WORKER_ENDPOINT = f"http://127.0.0.1:{int(os.environ.get('WECHAT_PORT_BASE', 33021)) + 2}/api/video-analysis-worker"
 MONITORING = DATA_ROOT / 'state/monitoring'
 ARTIFACTS = DATA_ROOT / 'state/video-analysis'
 RUNTIME = DATA_ROOT / 'runtime/video-analysis'

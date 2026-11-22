@@ -135,7 +135,12 @@ def run(args, **kwargs):
 def lines(image):
     buf = io.BytesIO()
     image.save(buf, format="PNG")
-    return json.loads(run([str(VISION)], input=buf.getvalue()))["lines"]
+    try:
+        from wechat_vision import recognize
+    except ImportError:
+        # Existing installations may still use the compiled Swift helper.
+        return json.loads(run([str(VISION)], input=buf.getvalue()))["lines"]
+    return recognize(buf.getvalue())["lines"]
 
 
 def visible_clock_position(image, expected_duration):

@@ -11,7 +11,12 @@ import tempfile
 from urllib.parse import urlsplit
 
 
-STORAGE_ROOT = Path('/Volumes/ssd1/wechat-monitor/media')
+if os.getenv('WECHAT_HOST_MEDIA_ROOT'):
+    # The dashboard sees /media, while settings retain paths usable by Mac workers.
+    STORAGE_ROOT = Path(os.environ['WECHAT_HOST_MEDIA_ROOT'])
+else:
+    from wechat_paths import DATA_ROOT
+    STORAGE_ROOT = DATA_ROOT / 'media'
 DEFAULT_STORAGE_PATH = STORAGE_ROOT / '微信视频号'
 SETTINGS_FILENAME = 'settings.json'
 

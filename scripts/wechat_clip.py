@@ -6,13 +6,12 @@ import json
 import math
 import os
 from pathlib import Path
-import plistlib
 import re
 import subprocess
 import sys
 import tempfile
 
-from capture_wechat_player import BASE, DISK_UUID
+from wechat_paths import DATA_ROOT as BASE, check_drive
 from wechat_preview import SHARE_URL
 from wechat_recording import file_signature
 
@@ -90,10 +89,7 @@ def clip_recording(source, output, *, start, end, audio_start=None, title="", au
     """
     source = Path(source).expanduser().resolve(strict=True)
     output = Path(output).expanduser().resolve()
-    volume = BASE.parent
-    info = plistlib.loads(run(["diskutil", "info", "-plist", str(volume)], 10).stdout)
-    if info.get("VolumeUUID") != DISK_UUID or BASE.stat().st_dev != volume.stat().st_dev:
-        raise OSError("the configured external SSD is unavailable")
+    check_drive(BASE)
     if BASE not in source.parents or BASE not in output.parents or source == output:
         raise ValueError("source and output must be distinct files under the external project directory")
     if output.suffix.lower() != ".mp4":
@@ -132,7 +128,7 @@ def clip_recording(source, output, *, start, end, audio_start=None, title="", au
     if output.exists():
         return existing()
     parent = next(p for p in output.parents if p.exists())
-    if parent.stat().st_dev != volume.stat().st_dev or initial.st_dev != volume.stat().st_dev:
+    if parent.stat().st_dev != BASE.stat().st_dev or initial.st_dev != BASE.stat().st_dev:
         raise ValueError("source or output is on another filesystem")
     # On removal, never recreate the mount path on the host filesystem.
     directory = parent

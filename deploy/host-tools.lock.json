@@ -1,0 +1,84 @@
+{
+  "python": {
+    "name": "cpython-3.12.16+20261110-aarch64-apple-darwin-install_only.tar.gz",
+    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261110/cpython-3.12.16%2B20261110-aarch64-apple-darwin-install_only.tar.gz",
+    "fallback": "https://api.github.com/repos/astral-sh/python-build-standalone/releases/assets/733711269",
+    "size": 25371130,
+    "sha256": "e956e60bc9465d577ef8062059aa05cd3a2665b4b8678a2ed24e432368330b8f"
+  },
+  "docker": {
+    "name": "docker-cli_29.10.0.tgz",
+    "url": "https://download.docker.com/mac/static/stable/aarch64/docker-cli_29.10.0.tgz",
+    "sha256": "0d8d39a9e30d74de006848add638d7f9fdf44cfd0fe9fd390934dd748b994ac8",
+    "size": 10337435
+  },
+  "compose": {
+    "name": "docker-compose-darwin-aarch64",
+    "url": "https://github.com/docker/compose/releases/download/v5.8.0/docker-compose-darwin-aarch64",
+    "fallback": "https://api.github.com/repos/docker/compose/releases/assets/759067212",
+    "size": 32440418,
+    "sha256": "008b8fcf6c6d60340f5796626a0f0d51c042085793a9b1653343011727140b71"
+  },
+  "buildx": {
+    "name": "buildx-v0.39.1.darwin-arm64",
+    "url": "https://github.com/docker/buildx/releases/download/v0.39.1/buildx-v0.39.1.darwin-arm64",
+    "fallback": "https://api.github.com/repos/docker/buildx/releases/assets/769871902",
+    "size": 65238528,
+    "sha256": "7a7f10602f0826d36b046e8db012b4cbfaa4ba56f9d2a5d374fe5bb7ae864fc4"
+  },
+  "ffmpeg": {
+    "name": "ffmpeg-n8.1.2-etv.9-macosarm64-gpl-8.1.tar.xz",
+    "url": "https://github.com/ErsatzTV/ErsatzTV-ffmpeg/releases/download/8.1.2-9/ffmpeg-n8.1.2-etv.9-macosarm64-gpl-8.1.tar.xz",
+    "fallback": "https://api.github.com/repos/ErsatzTV/ErsatzTV-ffmpeg/releases/assets/756722290",
+    "size": 32032064,
+    "sha256": "9a968391655cf1797f49e872283f6ca147948212a8745523057f7ce14f6eff53"
+  },
+  "chrome": {
+    "name": "chrome-headless-shell-158.0.8127.36-mac-arm64.zip",
+    "url": "https://storage.googleapis.com/chrome-for-testing-public/158.0.8127.36/mac-arm64/chrome-headless-shell-mac-arm64.zip",
+    "sha256": "c24d40a3786322ff3a5e3ac6eed162226cbaf07ebe468715407827226b0f8897",
+    "size": 105057133
+  },
+  "numpy": {
+    "name": "numpy-2.0.2-cp312-cp312-macosx_11_0_arm64.whl",
+    "url": "https://files.pythonhosted.org/packages/46/92/1b8b8dee833f53cef3e0a3f69b2374467789e0bb7399689582314df02651/numpy-2.0.2-cp312-cp312-macosx_11_0_arm64.whl",
+    "size": 13471835,
+    "sha256": "8df823f570d9adf0978347d1f926b2a867d5608f434a7cff7f7908c6570dcf5e"
+  },
+  "pillow": {
+    "name": "pillow-11.3.0-cp312-cp312-macosx_11_0_arm64.whl",
+    "url": "https://files.pythonhosted.org/packages/2c/32/7e2ac19b5713657384cec55f89065fb306b06af008cfd87e572035b27119/pillow-11.3.0-cp312-cp312-macosx_11_0_arm64.whl",
+    "size": 4686296,
+    "sha256": "921bd305b10e82b4d1f5e802b6850677f965d8394203d182f078873851dada69"
+  },
+  "pyobjc-core": {
+    "name": "pyobjc_core-11.1-cp312-cp312-macosx_10_13_universal2.whl",
+    "url": "https://files.pythonhosted.org/packages/c0/09/e83228e878e73bf756749939f906a872da54488f18d75658afa7f1abbab1/pyobjc_core-11.1-cp312-cp312-macosx_10_13_universal2.whl",
+    "size": 677985,
+    "sha256": "765b97dea6b87ec4612b3212258024d8496ea23517c95a1c5f0735f96b7fd529"
+  },
+  "pyobjc-framework-Cocoa": {
+    "name": "pyobjc_framework_cocoa-11.1-cp312-cp312-macosx_10_13_universal2.whl",
+    "url": "https://files.pythonhosted.org/packages/68/da/41c0f7edc92ead461cced7e67813e27fa17da3c5da428afdb4086c69d7ba/pyobjc_framework_cocoa-11.1-cp312-cp312-macosx_10_13_universal2.whl",
+    "size": 388983,
+    "sha256": "806de56f06dfba8f301a244cce289d54877c36b4b19818e3b53150eb7c2424d0"
+  },
+  "pyobjc-framework-Quartz": {
+    "name": "pyobjc_framework_quartz-11.1-cp312-cp312-macosx_10_13_universal2.whl",
+    "url": "https://files.pythonhosted.org/packages/9b/37/ee6e0bdd31b3b277fec00e5ee84d30eb1b5b8b0e025095e24ddc561697d0/pyobjc_framework_quartz-11.1-cp312-cp312-macosx_10_13_universal2.whl",
+    "size": 216410,
+    "sha256": "9ac806067541917d6119b98d90390a6944e7d9bd737f5c0a79884202327c9204"
+  },
+  "pyobjc-framework-Vision": {
+    "name": "pyobjc_framework_vision-11.1-cp312-cp312-macosx_10_13_universal2.whl",
+    "url": "https://files.pythonhosted.org/packages/a2/b5/54c0227a695557ea3065bc035b20a5c256f6f3b861e095eee1ec4b4d8cee/pyobjc_framework_vision-11.1-cp312-cp312-macosx_10_13_universal2.whl",
+    "size": 16829,
+    "sha256": "df076c3e3e672887182953efc934c1f9683304737e792ec09a29bfee90d2e26a"
+  },
+  "pyobjc-framework-CoreML": {
+    "name": "pyobjc_framework_coreml-11.1-cp312-cp312-macosx_10_13_universal2.whl",
+    "url": "https://files.pythonhosted.org/packages/3e/9e/a1b6d30b4f91c7cc4780e745e1e73a322bd3524a773f66f5eac0b1600d85/pyobjc_framework_coreml-11.1-cp312-cp312-macosx_10_13_universal2.whl",
+    "size": 11436,
+    "sha256": "c768b03d72488b964d753392e9c587684961d8237b69cca848b3a5a00aea79c9"
+  }
+}

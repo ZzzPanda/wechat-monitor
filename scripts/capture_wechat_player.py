@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 
-from wechat_paths import DATA_ROOT as BASE, DISK_UUID, DOCKER_HOST, check_drive
+from wechat_paths import DATA_ROOT as BASE, DOCKER_HOST, check_drive
 
 DOCKER = ['docker', '--host', DOCKER_HOST]
 CONTAINER = 'wx-playback'
