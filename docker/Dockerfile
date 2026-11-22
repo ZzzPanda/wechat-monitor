@@ -1,4 +1,5 @@
-FROM lscr.io/linuxserver/weixin@sha256:30f07c689b723ddd5bf807c239ed9000933ae7a5a9658599278e203dc753f133
+ARG BASE_IMAGE=lscr.io/linuxserver/weixin@sha256:30f07c689b723ddd5bf807c239ed9000933ae7a5a9658599278e203dc753f133
+FROM ${BASE_IMAGE}
 
 # The native client and Selkies desktop come from the ARM64 LinuxServer base.
 # Use only Debian's signed binary repositories for the capture toolchain.

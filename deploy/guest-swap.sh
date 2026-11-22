@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runs as root inside the project's Lima guest. Its root disk lives on ssd1.
+# Runs as root inside the project's Lima guest. Its root disk lives in the selected data directory.
 set -eu
 umask 077
 directory=/var/lib/wechatmonitor

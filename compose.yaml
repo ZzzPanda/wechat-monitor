@@ -23,7 +23,7 @@ services:
     volumes:
       - weixin-profile:/config
       - type: bind
-        source: ${WECHAT_MEDIA_DIR:-/Volumes/ssd1/wechat-monitor/media}
+        source: ${WECHAT_MEDIA_DIR:?set WECHAT_MEDIA_DIR}
         target: /config/Downloads
         bind:
           create_host_path: false
@@ -47,35 +47,36 @@ services:
       DASHBOARD_DB: /db/previews.sqlite3
       DASHBOARD_MEDIA: /media/微信视频号
       DASHBOARD_MEDIA_ROOT: /media
+      WECHAT_HOST_MEDIA_ROOT: ${WECHAT_MEDIA_DIR:?set WECHAT_MEDIA_DIR}
       DASHBOARD_POSTERS: /posters
     ports:
       - "127.0.0.1:33023:8080"
     volumes:
       - type: bind
-        source: ${WECHAT_STATE_DIR:-/Volumes/ssd1/wechat-monitor/state}/dashboard-app
+        source: ${WECHAT_STATE_DIR:?set WECHAT_STATE_DIR}/dashboard-app
         target: /app
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ${WECHAT_STATE_DIR:-/Volumes/ssd1/wechat-monitor/state}/wechat-pilot
+        source: ${WECHAT_STATE_DIR:?set WECHAT_STATE_DIR}/wechat-pilot
         target: /db
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ${WECHAT_MEDIA_DIR:-/Volumes/ssd1/wechat-monitor/media}
+        source: ${WECHAT_MEDIA_DIR:?set WECHAT_MEDIA_DIR}
         target: /media
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ${WECHAT_STATE_DIR:-/Volumes/ssd1/wechat-monitor/state}/monitoring
+        source: ${WECHAT_STATE_DIR:?set WECHAT_STATE_DIR}/monitoring
         target: /authors
         bind:
           create_host_path: false
       - type: bind
-        source: ${WECHAT_STATE_DIR:-/Volumes/ssd1/wechat-monitor/state}/posters
+        source: ${WECHAT_STATE_DIR:?set WECHAT_STATE_DIR}/posters
         target: /posters
         read_only: true
         bind:

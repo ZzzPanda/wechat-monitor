@@ -5,7 +5,6 @@ import json
 from contextlib import ExitStack, redirect_stdout
 import os
 from pathlib import Path
-import plistlib
 import runpy
 import shutil
 import signal
@@ -28,9 +27,12 @@ recordings = entry['recordings']
 
 class Saving(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(dir=preview.ROOT / 'tmp', prefix='save-regression-')
+        temporary = tempfile.TemporaryDirectory(prefix='save-regression-')
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        instance = Path(temporary.name).resolve()
+        (instance / '.wechat-monitor-volume').write_text('test-volume\n')
+        self.root = instance / 'tmp'
+        self.root.mkdir()
         self.media = self.root / 'media'
         self.media.mkdir()
         self.settings_path = self.root / 'settings.json'
@@ -53,7 +55,12 @@ class Saving(unittest.TestCase):
             return dict(start=0.0, end=1.0, duration=1.0, last_position=0), lambda: True
         stack = ExitStack()
         self.addCleanup(stack.close)
-        stack.enter_context(patch.dict(save.__globals__, STAGING=self.root / 'staging', STATE=self.root, take_from_player=take))
+        stack.enter_context(patch('wechat_paths.volume_uuid', return_value=('test-volume', instance.parent)))
+        stack.enter_context(patch('wechat_paths.DATA_ROOT', instance))
+        stack.enter_context(patch('wechat_clip.BASE', instance))
+        stack.enter_context(patch('capture_wechat_player.BASE', instance))
+        stack.enter_context(patch.dict(save.__globals__, ROOT=instance, STAGING=self.root / 'staging',
+                                      STATE=self.root, MONITORING=self.root / 'monitoring', take_from_player=take))
         stack.enter_context(patch.multiple(recordings, MEDIA=self.media / '微信视频号',
                                            STORAGE_ROOT=self.media, SETTINGS_FILE=self.settings_path))
 
@@ -440,8 +447,7 @@ class Saving(unittest.TestCase):
                 self.assertEqual(caught.exception.status, 'incomplete_playback')
 
     def test_wrong_drive(self):
-        result = subprocess.CompletedProcess([], 0, stdout=plistlib.dumps({'VolumeUUID': 'different-drive'}))
-        with patch.object(subprocess, 'run', return_value=result):
+        with patch('wechat_paths.volume_uuid', return_value=('different-drive', self.root.parent)):
             with self.assertRaises(entry['SaveError']) as error:
                 entry['verify_disk']()
         self.assertEqual(error.exception.status, 'disk_unavailable')

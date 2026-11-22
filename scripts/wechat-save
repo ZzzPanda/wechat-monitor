@@ -8,7 +8,6 @@ import json
 import math
 import os
 from pathlib import Path
-import plistlib
 import re
 import shutil
 import signal
@@ -23,7 +22,7 @@ import wechat_preview as preview
 import wechat_recording as recordings
 
 from wechat_events import write_event
-from wechat_paths import DATA_ROOT as ROOT, VOLUME, DISK_UUID, DOCKER_HOST
+from wechat_paths import DATA_ROOT as ROOT, DOCKER_HOST, check_drive, child_on_drive
 
 AUTHORS = ROOT / 'config' / 'authors.txt'
 STATE = preview.DATABASE.parent
@@ -39,14 +38,12 @@ class SaveError(Exception):
 
 
 def verify_disk():
-    info = subprocess.run(['diskutil', 'info', '-plist', str(VOLUME)], capture_output=True, timeout=10)
-    if info.returncode or plistlib.loads(info.stdout).get('VolumeUUID') != DISK_UUID:
-        raise SaveError('disk_unavailable', '请挂载指定的 1 TB 外置盘 ssd1。')
-    for path in (ROOT, STATE, STAGING, recordings.STORAGE_ROOT, recordings.MEDIA):
-        resolved = path.resolve()
-        existing = next(p for p in (resolved, *resolved.parents) if p.exists())
-        if not resolved.is_relative_to(VOLUME) or existing.stat().st_dev != VOLUME.stat().st_dev:
-            raise SaveError('disk_unavailable', '项目数据路径不在指定的外盘。')
+    try:
+        check_drive(ROOT)
+        for path in (STATE, STAGING, recordings.STORAGE_ROOT, recordings.MEDIA):
+            child_on_drive(ROOT, path)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise SaveError('disk_unavailable', f'无法使用项目数据盘：{ROOT}') from exc
 
 
 def ensure_directory(path):

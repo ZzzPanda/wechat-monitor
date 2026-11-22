@@ -23,6 +23,18 @@ provision:
     #!/bin/sh
     set -eu
     test -x /usr/bin/dockerd
+    # The minimal guest has the resolved stub symlink but no resolved daemon.
+    # Restore the stub on each boot using the DNS supplied to this VM by DHCP.
+    if [ -L /etc/resolv.conf ] && [ ! -e /etc/resolv.conf ] &&
+       [ "$(readlink -m /etc/resolv.conf)" = /run/systemd/resolve/stub-resolv.conf ]; then
+      install -d /run/systemd/resolve
+      stub=$(mktemp /run/systemd/resolve/.dns.XXXXXX)
+      awk '/^DNS=/ {sub(/^DNS=/, ""); for (i=1; i<=NF; i++) print "nameserver", $i}' \
+        /run/systemd/netif/leases/* > "$stub"
+      test -s "$stub"
+      chmod 644 "$stub"
+      mv "$stub" /run/systemd/resolve/stub-resolv.conf
+    fi
     install -d /etc/systemd/system/docker.socket.d
     printf '[Socket]\nSocketUser={{.User}}\n' > /etc/systemd/system/docker.socket.d/wx.conf
     systemctl daemon-reload
@@ -33,19 +45,19 @@ probes:
     #!/bin/sh
     set -eu
     docker info >/dev/null
-  hint: Check Docker in the external VM.
+  hint: Check Docker in the dedicated WeChat VM.
 portForwards:
 - guestSocket: /var/run/docker.sock
   hostSocket: '{{.Dir}}/sock/docker.sock'
 - guestIP: 127.0.0.1
   guestPort: 33021
   hostIP: 127.0.0.1
-  hostPort: 33021
+  hostPort: @DESKTOP_PORT@
 - guestIP: 127.0.0.1
   guestPort: 33022
   hostIP: 127.0.0.1
-  hostPort: 33022
+  hostPort: @DESKTOP_TLS_PORT@
 - guestIP: 127.0.0.1
   guestPort: 33023
   hostIP: 127.0.0.1
-  hostPort: 33023
+  hostPort: @DASHBOARD_PORT@

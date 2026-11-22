@@ -20,7 +20,7 @@ from wechat_paths import DATA_ROOT, check_drive
 
 MONITORING = DATA_ROOT / 'state/monitoring'
 PLAYER_LOCK = DATA_ROOT / 'state/wechat-pilot/save.lock'
-ENDPOINT = 'http://127.0.0.1:33023/api/crawl-worker'
+ENDPOINT = f"http://127.0.0.1:{int(os.environ.get('WECHAT_PORT_BASE', 33021)) + 2}/api/crawl-worker"
 
 
 class ServiceError(Exception):
