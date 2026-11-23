@@ -133,6 +133,64 @@ class ProfileRecoveryTests(unittest.TestCase):
         self.assertFalse(self.page.opened_profile_tabs)
 
 
+class WorkLinkTests(unittest.TestCase):
+    def setUp(self):
+        self.page = discovery.ProfileDiscovery('测试作者')
+        self.page.size = (1000, 650)
+        self.page._point = Mock()
+        self.page._pause = Mock()
+        self.url = 'https://weixin.qq.com/sph/test'
+        self.page.copy_visible_share_url = Mock(return_value=self.url)
+        self.card = discovery.Tile(300, 350, b'cover')
+        frame = Image.new('RGB', self.page.size)
+        self.author = dict(x=70, y=600, width=100, height=20, text='测试作者')
+        self.caption = dict(x=32, y=550, width=160, height=20, text='这张作品卡的标题')
+        self.before = (frame, self.author, self.caption)
+
+        def wait(read, message, seconds):
+            result = read(frame)
+            if not result:
+                raise discovery.PlayerError(message)
+            return result
+        self.page.wait = wait
+
+    def test_share_works_without_a_recognizable_track(self):
+        with patch.object(discovery, 'footer', return_value=self.before):
+            self.assertEqual(self.page.open_work(self.card), self.url)
+        self.page.copy_visible_share_url.assert_called_once_with(self.before[0], self.author)
+        self.page._pause.assert_not_called()
+
+    def test_rejects_autoplay_changing_the_work_or_author_during_copy(self):
+        changed = (self.before[0], self.author, dict(self.caption, text='作者发的另一条作品'))
+        longer = (self.before[0], self.author, dict(self.caption, text=self.caption['text']+'续集'))
+        for after in (changed, longer, None):
+            with self.subTest(after=after), patch.object(discovery, 'footer', side_effect=[self.before, after]):
+                with self.assertRaisesRegex(discovery.PlayerError, '同一作者和作品'):
+                    self.page.open_work(self.card)
+        self.page._pause.assert_not_called()
+
+    def test_subtitle_merged_with_native_caption_requires_exact_local_reread(self):
+        merged = dict(self.caption, y=524, height=46, width=530, text='播放器字幕和其下的原生标题')
+        after = (self.before[0], self.author, merged)
+        for text in (self.caption['text']+'！', '作者发的另一条作品'):
+            with self.subTest(text=text), patch.object(discovery, 'footer', side_effect=[self.before, after]), \
+                    patch.object(discovery, 'lines', return_value=[{'text':text}]) as read:
+                if text.endswith('！'):
+                    self.assertEqual(self.page.open_work(self.card), self.url)
+                else:
+                    with self.assertRaisesRegex(discovery.PlayerError, '同一作者和作品'):
+                        self.page.open_work(self.card)
+                self.assertEqual(read.call_args.args[0].size, (344, 56))
+
+    def test_unreadable_caption_still_requires_verified_pause_and_author(self):
+        before = (self.before[0], self.author, None)
+        with patch.object(discovery, 'footer', side_effect=[before, None]):
+            with self.assertRaisesRegex(discovery.PlayerError, '再次核验作者'):
+                self.page.open_work(self.card)
+        self.page._pause.assert_called_once()
+        self.page.copy_visible_share_url.assert_not_called()
+
+
 class DiscoveryTests(unittest.TestCase):
     def traverse(self, pages, mode, known=(), *, end=True, failed=(), checkpoint=None, on_boundary=None):
         desktop = Mock()
@@ -203,6 +261,15 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(report['complete'])
         self.assertEqual(delivered, ['url-1','url-2'])
 
+    def test_unverified_card_breaks_the_run_of_known_works(self):
+        pages = [[0, 1, 2, 3, 4], [4, 5, 6, 7]]
+        known = {f'url-{n}' for n in range(7)}
+        with self.assertLogs(level='WARNING'):
+            delivered, report = self.traverse(pages, 'incremental', known, failed=[5])
+        self.assertEqual(delivered, ['url-7'])
+        self.assertFalse(report['complete'])
+        self.assertEqual(report['unverified_cards'], 1)
+
     def test_two_yields_resume_mid_view_and_at_the_end_of_a_view(self):
         pages = [[1, 2], [2, 3, 4], [4, 5, 6]]
         cursor = {}
@@ -221,7 +288,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(delivered, ['url-4'])
         delivered, result = self.traverse(pages, 'history', checkpoint=cursor)
         self.assertEqual(delivered, ['url-5', 'url-6'])
-        self.assertEqual(result, dict(complete=True, reason='微信显示列表到底，核实 6 条'))
+        self.assertEqual(result, dict(complete=True, reason='微信显示列表到底，核实 6 条', unverified_cards=0))
 
     def test_changed_middle_view_invalidates_the_old_prefix(self):
         pages = [[1, 2], [3, 4], [5, 6]]

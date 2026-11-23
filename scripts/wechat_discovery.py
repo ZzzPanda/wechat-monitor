@@ -15,7 +15,7 @@ from wechat_account_search import (
     AccountSearch, PROFILE, active_appended_tab, open_from_main, profile_name, search_accounts, windows,
 )
 from wechat_paths import check_drive
-from wechat_player import PlayerError, author_matches, center, guest, lines, norm, runs
+from wechat_player import PlayerError, author_matches, caption_text, center, guest, lines, norm, runs
 
 BASELINE_WORKS = 10
 PINNED_SLOTS = 3
@@ -230,14 +230,43 @@ class ProfileDiscovery(AccountSearch):
 
     def open_work(self, card):
         self._point(card.x, card.y, click=True)
-        _, author, caption = self.wait(lambda im: footer(im, self.author), '未能核实卡片对应的作品作者。', 7)
-        # The exact title may be split across several drawn labels. The source is
-        # already the verified profile and the newly opened player's author must match.
-        self.duration = self.seek_origin = None
-        self.title = caption or {'x': self.size[0]//35, 'y': author['y']-50}
-        self._pause()
-        image, author, _ = self.wait(lambda im: footer(im, self.author), '分享前无法再次核验作者。', 3)
-        return self.copy_visible_share_url(image, author)
+        image, author, caption = self.wait(lambda im: footer(im, self.author), '未能核实卡片对应的作品作者。', 7)
+        title = caption_text(caption['text']) if caption else ''
+        if len(title) < 5:
+            # Without a distinctive caption we cannot detect autoplay advancing
+            # to another work by this author. Keep the paused-player check here.
+            self.duration = self.seek_origin = None
+            self.title = caption or {'x': self.size[0]//35, 'y': author['y']-50}
+            self._pause()
+            image, author, _ = self.wait(lambda im: footer(im, self.author), '分享前无法再次核验作者。', 3)
+            return self.copy_visible_share_url(image, author)
+
+        url = self.copy_visible_share_url(image, author)
+
+        def same_work(im):
+            evidence = footer(im, self.author)
+            if not evidence:
+                return False
+            current = evidence[2]
+            if current:
+                if caption_text(current['text']) == title:
+                    return True
+                # A conflicting single line at the native title position is a
+                # different work, even when the new title starts with the old.
+                if abs(current['y'] - caption['y']) <= 6 and current['height'] <= 1.5 * caption['height']:
+                    return False
+            # Vision may join subtitles drawn inside the film to the native
+            # title below. Read just the original line at higher resolution.
+            if len(title) < 8 or caption['height'] > 1.5 * author['height']:
+                return False
+            x, y = caption['x'], caption['y']
+            band = im.crop((max(0, x-6), max(0, y-4), min(im.width, x+caption['width']+6),
+                            min(im.height, y+caption['height']+4)))
+            labels = lines(band.resize((band.width*2, band.height*2)))
+            return len(labels) == 1 and caption_text(labels[0]['text']) == title
+
+        self.wait(same_work, '复制分享链接后未能确认仍为同一作者和作品。', 3)
+        return url
 
     def return_to_grid(self, previous_count):
         bar = self.close_appended_tab(previous_count, self.tab_bar())
@@ -333,7 +362,7 @@ def _crawl_grid(profile, url, identity, mode, known, on_work, should_stop, check
     def result(detail, success=True):
         if failures:
             detail += f'；{failures} 张作品卡未能核验分享链接。最近原因：{last_card_error}'
-        return dict(complete=bool(success and not failures), reason=detail)
+        return dict(complete=bool(success and not failures), reason=detail, unverified_cards=failures)
 
     pages = grid_pages(profile)
     if (mode == 'history' and isinstance(checkpoint, dict) and checkpoint.get('v') == 1
@@ -386,6 +415,7 @@ def _crawl_grid(profile, url, identity, mode, known, on_work, should_stop, check
                 try:
                     work_url = profile.open_work(card)
                 except (PlayerError, ValueError) as exc:
+                    known_run = 0
                     failures += 1
                     last_card_error = str(exc)[:200]
                     logging.warning('%s 的作品卡 (%d, %d) 未能核验：%s',

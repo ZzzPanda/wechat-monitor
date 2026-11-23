@@ -740,7 +740,7 @@ class DashboardServer(ThreadingHTTPServer):
         elif op == 'item_done':
             queue.item_done(data['id'], data['url'], data['status'], data.get('error', ''))
         elif op == 'finish':
-            queue.finish(data['id'], data['status'], data.get('error', ''))
+            queue.finish(data['id'], data['status'], data.get('error', ''), unverified_cards=data.get('unverified_cards'))
         else:
             raise ValueError('采集进程操作无效。')
         return {'ok': True}

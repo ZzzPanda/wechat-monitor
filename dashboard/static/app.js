@@ -778,9 +778,12 @@ function renderCrawls() {
   scheduleSave.disabled = !scheduleEdited || savingSchedule || !scheduleInterval.validity.valid || !scheduleStart.validity.valid;
   byId("crawl-jobs").replaceChildren(...jobs.map(job => {
     const row = element("li", "crawl-job");
+    let counts = "发现 " + job.discovered + " · 已保存 " + job.saved + " · 已跳过 " + job.skipped;
+    if (job.failed) counts += " · 处理失败 " + job.failed;
+    if (job.unverified_cards) counts += " · 未核验卡片 " + job.unverified_cards;
     row.append(element("strong", "", job.author), element("span", "", job.mode === "history" ? "历史作品" : "增量作品"),
       element("span", "", jobLabels[job.status] || job.status), element("span", "", crawlTime(job.created_at)),
-      element("span", "", "发现 " + job.discovered + " · 已保存 " + job.saved + " · 已跳过 " + job.skipped + " · 失败 " + job.failed));
+      element("span", "", counts));
     if (ongoing(job)) {
       const stopping = stoppingJobs.has(job.id) || job.cancel_requested;
       const button = element("button", "cancel-crawl", stopping ? "正在停止…" : "停止");

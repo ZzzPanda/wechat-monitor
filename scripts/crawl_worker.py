@@ -79,6 +79,7 @@ def run_job(api, job, saver, db, discover):
     entry = dict(name=name, url=profile)
     details = {}
     failed_keys = set()
+    unverified_cards = None
     processed = 0
     checkpoint = job.get('checkpoint')
 
@@ -165,6 +166,7 @@ def run_job(api, job, saver, db, discover):
     try:
         resume = dict(checkpoint=checkpoint, on_boundary=yield_at_boundary) if mode == 'history' else {}
         outcome = discover(entry, mode=mode, known=known, on_work=handle, should_stop=stopped, **resume)
+        unverified_cards = outcome.get('unverified_cards')
         if outcome.get('yielded'):
             # The same job is already queued with its checkpoint. A finish or
             # cancellation here would discard the remainder of the history scan.
@@ -183,7 +185,7 @@ def run_job(api, job, saver, db, discover):
     except Exception as exc:
         status = 'partial' if processed or failed_keys else 'failed'
         message = str(exc)[:400] or '采集未完成。'
-    api('finish', id=job_id, status=status, error=message[:500])
+    api('finish', id=job_id, status=status, error=message[:500], unverified_cards=unverified_cards)
 
 
 def run_public_job(api, job, discover, read_article):

@@ -146,7 +146,7 @@ class CrawlWorkerTests(unittest.TestCase):
                 self.assertFalse(known(new))
                 on_work(new)
                 return dict(complete=True, reason='增量检查结束')
-            return dict(complete=False, reason='一张作品卡未能核验')
+            return dict(complete=False, reason='作品卡未能核验', unverified_cards=1)
 
         accounts = []
         for _ in range(2):
@@ -156,7 +156,10 @@ class CrawlWorkerTests(unittest.TestCase):
             crawl_worker.run_job(self.api, increment, self.saver, self.downloads, incremental_grid)
         self.assertCountEqual(accounts, [self.entry['name'], '第二个账号'])
         peer_job = next(j for j in self.queue.snapshot()['jobs'] if j['author'] == '第二个账号')
-        self.assertEqual(peer_job['status'], 'partial')
+        self.assertEqual((peer_job['status'], peer_job['failed'], peer_job['unverified_cards']), ('partial', 0, 1))
+        log = next(row for row in self.queue.log_entries(0, 2**63-1, 10) if '第二个账号' in row['message'])
+        self.assertIn('1 张作品卡未能核验', log['message'])
+        self.assertNotIn('失败 0 条', log['message'])
         resumed = self.api('claim')['job']
         self.assertEqual((resumed['id'], resumed['saved']), (history, 1))
         crawl_worker.run_job(self.api, resumed, self.saver, self.downloads, history_grid)

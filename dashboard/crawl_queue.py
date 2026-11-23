@@ -3,6 +3,7 @@ from contextlib import closing, contextmanager
 import hashlib
 import json
 from pathlib import Path
+import re
 import sqlite3
 import threading
 import time
@@ -17,7 +18,7 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY, author TEXT NOT NULL, profile_url TEXT, mode TEXT NOT NULL,
     status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '',
-    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, unverified_cards INTEGER
 );
 CREATE INDEX IF NOT EXISTS jobs_by_status ON jobs(status, created_at);
 CREATE INDEX IF NOT EXISTS jobs_by_profile ON jobs(profile_url, status);
@@ -70,11 +71,20 @@ def next_slot(start_at, interval_minutes, earliest):
     return due
 
 
+def job_result(row):
+    result = dict(row)
+    if result['unverified_cards'] is None:
+        # Older workers only persisted the count in the job summary.
+        count = re.search(r'(?:^|；)([0-9]{1,9}) 张作品卡未能核验分享链接', result['error'])
+        result['unverified_cards'] = int(count[1]) if count else 0
+    return result
+
+
 def job_row(db, job_id):
     row = db.execute(JOB_SELECT + ' WHERE j.id=? GROUP BY j.id', (job_id,)).fetchone()
     if row is None:
         raise KeyError(job_id)
-    return dict(row)
+    return job_result(row)
 
 
 def job_status(db, job_id):
@@ -102,6 +112,8 @@ class Queue:
                     if not self._ready:
                         db.executescript(SCHEMA)
                         db.execute('BEGIN IMMEDIATE')
+                        if 'unverified_cards' not in {r['name'] for r in db.execute('PRAGMA table_info(jobs)')}:
+                            db.execute('ALTER TABLE jobs ADD COLUMN unverified_cards INTEGER')
                         if 'start_at' not in {r['name'] for r in db.execute('PRAGMA table_info(settings)')}:
                             db.execute('ALTER TABLE settings ADD COLUMN start_at INTEGER')
                             db.execute('UPDATE settings SET start_at=next_run,interval_minutes=max(60,interval_minutes)')
@@ -126,7 +138,7 @@ class Queue:
                 GROUP BY j.id
                 ORDER BY CASE j.status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
                          j.created_at DESC,j.rowid DESC""")
-            return dict(settings=settings_row(db), jobs=[dict(r) for r in rows])
+            return dict(settings=settings_row(db), jobs=[job_result(r) for r in rows])
 
     def log_entries(self, start, end, limit):
         """Summarize existing completed jobs without exposing command output or share links."""
@@ -136,11 +148,11 @@ class Queue:
         with self.db() as db:
             rows = db.execute("""
                 WITH recent AS (
-                    SELECT rowid AS ordinal, id, author, mode, status, updated_at FROM jobs
+                    SELECT rowid AS ordinal, id, author, mode, status, updated_at, error, unverified_cards FROM jobs
                     WHERE updated_at BETWEEN ? AND ? AND status IN ('done','partial','cancelled','failed')
                     ORDER BY updated_at DESC, rowid DESC LIMIT ?
                 )
-                SELECT r.author, r.mode, r.status, r.updated_at,
+                SELECT r.author, r.mode, r.status, r.updated_at, r.error, r.unverified_cards,
                        count(i.work_key) AS discovered,
                        count(CASE WHEN i.status='saved' THEN 1 END) AS saved,
                        count(CASE WHEN i.status='failed' THEN 1 END) AS failed
@@ -148,11 +160,17 @@ class Queue:
                 GROUP BY r.id ORDER BY r.updated_at DESC, r.ordinal DESC
             """, (start, end, limit)).fetchall()
         entries = []
-        for row in rows:
+        for record in rows:
+            row = job_result(record)
             outcome, level = outcomes[row['status']]
             author = ' '.join(row['author'].split())[:150]
             message = (f'{author} · {modes.get(row["mode"], "视频采集")}{outcome}。'
-                       f'发现 {row["discovered"]} 条，保存 {row["saved"]} 条，失败 {row["failed"]} 条。')
+                       f'发现 {row["discovered"]} 条，保存 {row["saved"]} 条')
+            if row['failed']:
+                message += f'，处理失败 {row["failed"]} 条'
+            if row['unverified_cards']:
+                message += f'，另有 {row["unverified_cards"]} 张作品卡未能核验'
+            message += '。'
             entries.append(dict(time=row['updated_at'], category='crawl', level=level, message=message))
         return entries
 
@@ -326,28 +344,34 @@ class Queue:
                        (status, error, job_id, row['work_key']))
             db.execute('UPDATE jobs SET updated_at=? WHERE id=?', (int(time.time()), job_id))
 
-    def finish(self, job_id, status, error=''):
+    def finish(self, job_id, status, error='', *, unverified_cards=None):
         if status not in ('done', 'partial', 'failed', 'cancelled'):
             raise ValueError('未知的采集完成状态。')
+        if unverified_cards is not None and (type(unverified_cards) is not int or not 0 <= unverified_cards < 2**63):
+            raise ValueError('未核验卡片数无效。')
         with self.db(write=True) as db:
             current = job_status(db, job_id)
             if current in (status, 'cancelled'):
                 return job_row(db, job_id)
-            if current != 'running':
-                raise ValueError('该采集任务未在运行。')
             if status != 'cancelled':
                 counts = dict(db.execute('SELECT status,count(*) FROM items WHERE job_id=? GROUP BY status',
                                          (job_id,)).fetchall())
                 failed, pending = counts.get('failed', 0), counts.get('pending', 0)
-                if ((status == 'done' and (failed or pending)) or
+                if ((status == 'done' and (failed or pending or unverified_cards)) or
                         (status == 'failed' and any(counts.get(s) for s in SUCCESS))):
                     status = 'partial'
                 if failed:
                     error = '；'.join(filter(None, (error, f'{failed} 条作品处理失败，可重新拉取历史作品重试。')))
                 if pending:
                     error = '；'.join(filter(None, (error, f'{pending} 条作品尚未处理完成。')))
-            db.execute('UPDATE jobs SET status=?,error=?,updated_at=? WHERE id=?',
-                       (status, error, int(time.time()), job_id))
+            # A repeated finish request can propose "done" even though the
+            # stored item results made the first request finish as "partial".
+            if current == status:
+                return job_row(db, job_id)
+            if current != 'running':
+                raise ValueError('该采集任务未在运行。')
+            db.execute('UPDATE jobs SET status=?,error=?,updated_at=?,unverified_cards=? WHERE id=?',
+                       (status, error, int(time.time()), unverified_cards, job_id))
             return job_row(db, job_id)
 
     def known(self, profile_url, key):

@@ -50,6 +50,24 @@ class CrawlQueueTests(unittest.TestCase):
             monthly = self.queue.configure(True, 30 * 24 * 60)
             self.assertEqual(monthly['interval_minutes'], 43200)
 
+    def test_legacy_job_reports_unverified_cards_without_exposing_raw_error(self):
+        with sqlite3.connect(self.path) as db:
+            db.execute('''CREATE TABLE jobs(id TEXT PRIMARY KEY, author TEXT, profile_url TEXT,
+                       mode TEXT, status TEXT, error TEXT, created_at INTEGER, updated_at INTEGER)''')
+            db.execute('INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?)',
+                       ('legacy', '示例', 'profile', 'incremental', 'partial',
+                        '已到历史边界；2 张作品卡未能核验分享链接。最近原因：private detail', 1, 2))
+        self.assertEqual(self.queue.snapshot()['jobs'][0]['unverified_cards'], 2)
+        message = self.queue.log_entries(1, 2, 1)[0]['message']
+        self.assertIn('2 张作品卡未能核验', message)
+        self.assertNotIn('private', message)
+
+    def test_finish_retry_preserves_partial_result_from_unverified_cards(self):
+        job = self.start('incremental')
+        first = self.queue.finish(job, 'done', unverified_cards=2)
+        self.assertEqual((first['status'], first['unverified_cards']), ('partial', 2))
+        self.assertEqual(self.queue.finish(job, 'done', unverified_cards=2), first)
+
     def test_fixed_start_keeps_daily_slots_after_sleep_and_restart(self):
         day = 86400
         anchor = 100000
