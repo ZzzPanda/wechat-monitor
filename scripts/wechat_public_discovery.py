@@ -8,7 +8,7 @@ import time
 
 import numpy as np
 
-from wechat_account_search import AccountSearch, clipboard, open_from_main, windows
+from wechat_account_search import AccountSearch, active_appended_tab, clipboard, open_from_main, windows
 from wechat_paths import check_drive
 from wechat_player import PlayerError, author_matches, center, guest, lines, norm, runs
 
@@ -23,14 +23,15 @@ try:
     u = urlsplit(value.strip())
     if u.netloc != 'mp.weixin.qq.com' or u.scheme not in ('http','https'):
         sys.exit()
-    q = parse_qs(u.query)
+    q = parse_qs(u.query, keep_blank_values=True)
+    unique = all(len(values) == 1 for values in q.values())
     if sys.argv[1] == 'profile':
         biz = q.get('__biz', [''])[0]
-        if u.path.startswith('/mp/profile') and re.fullmatch(r'[A-Za-z0-9_+/=-]{5,192}', biz):
+        if unique and u.path.startswith('/mp/profile') and re.fullmatch(r'[A-Za-z0-9_+/=-]{5,192}', biz):
             print(biz)
     elif re.fullmatch(r'/s/[A-Za-z0-9_-]+', u.path):
         print('https://mp.weixin.qq.com' + u.path)
-    elif u.path == '/s' and all(len(q.get(k, [])) == 1 for k in ('__biz','mid','idx','sn')):
+    elif u.path == '/s' and unique and all(q.get(k, [''])[0] for k in ('__biz','mid','idx','sn')):
         print(urlunsplit(('https',u.netloc,u.path,urlencode([(k,q[k][0]) for k in ('__biz','mid','idx','sn')]),'')))
 except ValueError:
     pass
@@ -58,12 +59,29 @@ def search_hit(image, query):
 def account_header(image, name):
     left = image.width//2 - 160
     rows = lines(image.crop((left, 63, left+382, 161)))
+    # Vision can append the separate live-status badge to the rendered account name.
+    # Keep the exact match first, including for account names containing “直播中”.
     title = next((r for r in rows if r['x'] < 32 and r['y'] < 58
-                  and author_matches(r['text'], name)), None)
+                  and (author_matches(r['text'], name) or
+                       norm(re.sub(r'\s+◎\s*直播中\s*$', '', r['text'])) == norm(name))), None)
     if title:
         subject = next((r['text'] for r in rows if r['x'] < 32 and
                         19 <= r['y']-title['y'] <= 47), '')
         return dict(name=name, description=subject)
+
+
+def profile_access_notice(image):
+    labels = [norm(r['text']) for r in lines(image.crop((0, 60, image.width, image.height)))]
+    if any(label in ('去验证', '完成验证', '安全验证', '微信安全验证', '环境异常', '当前环境异常') or
+           '完成验证后即可继续访问' in label for label in labels):
+        return '微信要求完成安全验证，请在微信桌面查看。'
+    if any(label in ('请登录', '请先登录', '重新登录', '请登录微信', '请先登录微信', '微信登录',
+                     '扫码登录', '登录已过期') or '请使用微信扫码登录' in label for label in labels):
+        return '微信提示需要登录，请在微信桌面查看。'
+    if any('访问过于频繁' in label or label in ('该公众号已注销', '该账号已被封禁')
+           for label in labels):
+        return '微信限制了当前主页的访问，请在微信桌面查看。'
+    return None
 
 
 @dataclass(frozen=True)
@@ -202,6 +220,45 @@ class PublicProfile(AccountSearch):
             self._point(self.size[0]-116, 72)
 
     @contextmanager
+    def account_result(self, query, hit):
+        tabs, search_tab, _ = self.tab_bar()
+        timeout = f'微信未显示「{query}」的公众号主页标题。'
+
+        def checked_header(image):
+            info = account_header(image, query)
+            if info and not active_appended_tab(self.tab_bar(image), len(tabs)):
+                raise PlayerError('核验公众号时活动标签页已改变。')
+            return info
+
+        def find_again(image):
+            current, active, _ = self.tab_bar(image)
+            if len(current) != len(tabs) or active != search_tab:
+                raise PlayerError('未能返回原搜索标签页，无法重新打开公众号。')
+            return search_hit(image, query)
+
+        for attempt in range(2):
+            if attempt:
+                hit = self.wait(find_again, '原搜索页未再次显示该公众号的确切匹配结果。', 5)
+            with self.opened_tab(lambda: self._point(*hit, click=True)):
+                try:
+                    info = self.wait(checked_header, timeout, 10)
+                except PlayerError as exc:
+                    if str(exc) != timeout:
+                        raise
+                    image = self.image()
+                    if not active_appended_tab(self.tab_bar(image), len(tabs)):
+                        raise PlayerError('核验公众号时活动标签页已改变。') from exc
+                    notice = profile_access_notice(image)
+                    if notice:
+                        raise PlayerError(notice) from exc
+                    if attempt:
+                        raise PlayerError(f'两次打开「{query}」的搜索结果后均未识别到主页标题。') from exc
+                    logging.warning('%s 将从原搜索页重新核对并打开结果。', timeout)
+                    continue
+                yield info
+                return
+
+    @contextmanager
     def profile(self, query):
         ids = windows('^WeChatAppEx$') or open_from_main()
         if len(ids) != 1:
@@ -241,8 +298,7 @@ class PublicProfile(AccountSearch):
             if hit == 'empty':
                 yield None
                 return
-            with self.opened_tab(lambda: self._point(*hit,click=True)):
-                info = self.wait(lambda im: account_header(im, query), '微信未显示选中公众号的主页。', 10)
+            with self.account_result(query, hit) as info:
                 biz = self.public_address('profile')
                 if not biz:
                     # Some client versions use an internal profile address. Resolve

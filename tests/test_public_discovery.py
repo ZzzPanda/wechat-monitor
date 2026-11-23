@@ -1,5 +1,6 @@
 """Regression cases for public-account list paging and multi-article rows."""
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext, redirect_stdout
+import io
 from pathlib import Path
 import sys
 import unittest
@@ -11,7 +12,45 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import wechat_public_discovery as public
 
 
+class PublicAddressTests(unittest.TestCase):
+    def read_address(self, kind, url):
+        output = io.StringIO()
+        with patch.object(sys, 'argv', ['-c', kind]), patch('subprocess.run') as run, redirect_stdout(output):
+            run.return_value.stdout = url.encode()
+            exec(public.READ_ADDRESS, {})
+        return output.getvalue().strip()
+
+    def test_guest_rejects_ambiguous_parameters_before_normalizing_addresses(self):
+        profile = 'https://mp.weixin.qq.com/mp/profile_ext?__biz=MTc5MTU3NTYyMQ%3D%3D'
+        article = 'https://mp.weixin.qq.com/s?__biz=MTc5MTU3NTYyMQ%3D%3D&mid=123&idx=2&sn=' + 'a'*32
+        self.assertEqual(self.read_address('profile', profile + '&scene=7'), 'MTc5MTU3NTYyMQ==')
+        self.assertEqual(self.read_address('article', article + '&scene=7'), article)
+        for kind, url in (('profile', profile), ('article', article)):
+            for duplicate in ('&__biz=another', '&__biz=', '&scene=&scene=abc'):
+                with self.subTest(kind=kind, duplicate=duplicate):
+                    self.assertEqual(self.read_address(kind, url + duplicate), '')
+        for key in ('mid', 'idx', 'sn'):
+            self.assertEqual(self.read_address('article', article + '&' + key + '='), '')
+        self.assertEqual(self.read_address('article', article.replace('idx=2', 'idx=')), '')
+
+
 class ArticleRowsTests(unittest.TestCase):
+    def test_account_title_merged_or_separate_live_badge(self):
+        image = Image.new('RGB', (1158, 960))
+        title = dict(text='三联生活周刊', x=11, y=25)
+        subject = dict(text='三联生活传媒有限公司', x=11, y=57)
+        for rows in ([dict(title, text='三联生活周刊 ◎直播中'), subject],
+                     [title, dict(text='◎直播中', x=145, y=25), subject]):
+            with self.subTest(rows=rows), patch.object(public, 'lines', return_value=rows):
+                self.assertEqual(public.account_header(image, '三联生活周刊'),
+                                 dict(name='三联生活周刊', description=subject['text']))
+        for actual in ('三联生活周刊副刊 ◎直播中', '三联生活周刊 甲 ◎直播中', '三联生活周刊直播中',
+                       '三联生活周刊 直播中', '三联生活周刊 ◎直播中报道'):
+            with self.subTest(actual=actual), patch.object(public, 'lines', return_value=[dict(title, text=actual)]):
+                self.assertIsNone(public.account_header(image, '三联生活周刊'))
+        with patch.object(public, 'lines', return_value=[dict(title, text='三联生活周刊直播中 ◎直播中')]):
+            self.assertEqual(public.account_header(image, '三联生活周刊直播中')['name'], '三联生活周刊直播中')
+
     def test_number_of_pinned_items_needs_its_section_label(self):
         frame = Image.new('RGB', (1158, 960))
         heading = dict(text='置顶', x=9, y=191, width=34, height=20)
@@ -58,6 +97,82 @@ class ArticleRowsTests(unittest.TestCase):
             self.assertIsNone(public.search_hit(frame, '三联'))
         with patch.object(public, 'lines', return_value=[row, dict(tag, text='视频号')]):
             self.assertIsNone(public.search_hit(frame, '三联生活周刊'))
+
+
+class ProfileRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.browser = public.PublicProfile('周刊')
+        self.search = Image.new('RGB', (1158, 960))
+        self.result = self.search.copy()
+        self.current = self.search
+        self.browser.image = lambda: self.current
+        self.browser._point = Mock()
+        self.browser.tab_bar = lambda image=None: (([120, 180], 1, 260) if self.current is self.search
+                                                   else ([120, 180, 240], 2, 320))
+
+        @contextmanager
+        def opened_tab(opener):
+            self.assertIs(self.current, self.search)
+            opener()
+            self.current = self.result
+            try:
+                yield
+            finally:
+                self.current = self.search
+
+        def wait(read, error, seconds):
+            value = read(self.current)
+            if not value:
+                raise public.PlayerError(error)
+            return value
+
+        self.browser.opened_tab = opened_tab
+        self.browser.wait = wait
+
+    def test_profile_timeout_reopens_fresh_exact_match_and_restores_search_tab(self):
+        info = dict(name='周刊', description='测试主体')
+        with patch.object(public, 'account_header', side_effect=[None, info]), \
+             patch.object(public, 'lines', return_value=[]), \
+             patch.object(public, 'search_hit', return_value=(170, 310)) as find, \
+             self.assertLogs(level='WARNING'):
+            with self.browser.account_result('周刊', (150, 300)) as actual:
+                self.assertEqual(actual, info)
+                self.assertIs(self.current, self.result)
+        find.assert_called_once_with(self.search, '周刊')
+        self.assertEqual(self.browser._point.call_args_list, [call(150, 300, click=True), call(170, 310, click=True)])
+        self.assertIs(self.current, self.search)
+
+    def test_persistent_unrecognized_profile_ends_after_two_attempts(self):
+        with patch.object(public, 'account_header', return_value=None), \
+             patch.object(public, 'lines', return_value=[]), \
+             patch.object(public, 'search_hit', return_value=(170, 310)), self.assertLogs(level='WARNING'), \
+             self.assertRaisesRegex(public.PlayerError, '两次打开.*均未识别到主页标题'):
+            with self.browser.account_result('周刊', (150, 300)):
+                self.fail('unverified account')
+        self.assertEqual(self.browser._point.call_count, 2)
+        self.assertIs(self.current, self.search)
+
+    def test_reopen_never_uses_the_old_hit_when_result_disappears(self):
+        with patch.object(public, 'account_header', return_value=None), \
+             patch.object(public, 'lines', return_value=[]), \
+             patch.object(public, 'search_hit', return_value=None), self.assertLogs(level='WARNING'), \
+             self.assertRaisesRegex(public.PlayerError, '未再次显示'):
+            with self.browser.account_result('周刊', (150, 300)):
+                self.fail('removed account')
+        self.browser._point.assert_called_once_with(150, 300, click=True)
+        self.assertIs(self.current, self.search)
+
+    def test_login_or_verification_notice_ends_without_reopening(self):
+        for label, error in [('请先登录微信', '需要登录'), ('完成验证后即可继续访问', '安全验证')]:
+            with self.subTest(label=label):
+                self.browser._point.reset_mock()
+                with patch.object(public, 'account_header', return_value=None), \
+                     patch.object(public, 'lines', return_value=[dict(text=label)]), \
+                     self.assertRaisesRegex(public.PlayerError, error):
+                    with self.browser.account_result('周刊', (150, 300)):
+                        self.fail('restricted account')
+                self.browser._point.assert_called_once_with(150, 300, click=True)
+                self.assertIs(self.current, self.search)
 
 
 class CrawlTests(unittest.TestCase):

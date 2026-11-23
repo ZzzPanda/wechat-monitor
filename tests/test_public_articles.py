@@ -17,6 +17,7 @@ BIZ = 'Qm9va3M='
 ARTICLE = dict(biz=BIZ, mid='2651615288', idx=1, author='示例周刊', title='同一标题',
                published='2026-11-20 21:00:00', url='https://mp.weixin.qq.com/s/example',
                body='第一段\n同标题的另一篇也要保存。')
+LONG = f"https://mp.weixin.qq.com/s?__biz=Qm9va3M%3D&mid={ARTICLE['mid']}&idx=1&sn={'ab'*16}"
 
 
 class ArchiveTest(unittest.TestCase):
@@ -72,6 +73,81 @@ class ArchiveTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.save(job['id'], ARTICLE)
         self.assertEqual(self.store.list_articles()['total'], 1)
+
+    def test_long_links_match_only_the_verified_account_push_and_position(self):
+        job = self.start()['id']
+        self.store.save(job, ARTICLE)
+        self.assertEqual(self.store.skip_known(job, LONG), ARTICLE['published'])
+        self.assertFalse(self.store.known_url('other-account', LONG))
+        self.assertIsNone(self.store.skip_known(job, LONG.replace('idx=1', 'idx=2')))
+        for url in (LONG + '&idx=', LONG.replace('idx=1', 'idx=1&idx=2'),
+                    LONG.replace('idx=1', 'idx=99999999999999999999'), LONG.replace('Qm9va3M%3D', 'foreign')):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                self.store.skip_known(job, url)
+        result = self.store.finish(job, 'done')
+        self.assertEqual((result['discovered'], result['saved'], result['failed']), (1, 1, 0))
+
+    def test_verified_old_skip_reused_only_for_covering_incremental_cutoff_without_archived_siblings(self):
+        self.store.configure(False, 60)
+        job = self.start('incremental')
+        self.store.skip_before(job['id'], dict(ARTICLE, published='2020-01-01 00:00:00'))
+        self.assertTrue(self.store.check_known(job['id'], LONG)['before_cutoff'])
+        self.store.finish(job['id'], 'done')
+        history = self.start()['id']
+        self.assertEqual(self.store.check_known(history, LONG), {'published': None})
+        self.store.finish(history, 'done')
+        repeat = self.start('incremental')['id']
+        with self.store.db(write=True) as db:
+            db.execute('UPDATE job_options SET since=? WHERE job_id=?', (job['since']-60, repeat))
+        self.assertEqual(self.store.check_known(repeat, LONG), {'published': None})
+        with self.store.db(write=True) as db:
+            db.execute('UPDATE job_options SET since=? WHERE job_id=?', (job['since']+60, repeat))
+        self.assertTrue(self.store.check_known(repeat, LONG)['before_cutoff'])
+        self.store.save(repeat, dict(ARTICLE, idx=2, url='https://mp.weixin.qq.com/s/sibling'))
+        self.assertEqual(self.store.check_known(repeat, LONG), {'published': None})
+        old = dict(ARTICLE, published='2020-01-01 00:00:00')
+        self.assertEqual(self.store.skip_before(repeat, old), 'saved')
+        with self.assertRaises(ValueError):
+            self.store.skip_before(repeat, dict(old, mid='456'))
+        self.assertEqual(self.store.finish(repeat, 'done')['saved'], 2)
+        followup = self.start('incremental')['id']
+        self.assertEqual(self.store.check_known(followup, LONG), {'published': old['published']})
+
+    def test_recovered_job_resolves_old_url_key_when_short_link_succeeds(self):
+        job = self.start()['id']
+        with self.store.db(write=True) as db:
+            db.execute('INSERT INTO items(job_id,work_key,url,status,error) VALUES(?,?,?,?,?)',
+                       (job, 'url:'+digest(LONG), LONG, 'failed', '页面需要验证'))
+        self.assertEqual(self.store.recover(), 1)
+        self.assertEqual(self.store.claim()['failed'], 1)
+        self.store.save(job, ARTICLE)
+        finished = self.store.finish(job, 'done')
+        self.assertEqual((finished['status'], finished['discovered'], finished['saved'], finished['failed']),
+                         ('done', 1, 1, 0))
+
+    def test_failed_sibling_backfill_reopens_old_skip_without_downgrading_archived_article(self):
+        self.store.configure(False, 60)
+        job = self.start('incremental')
+        old = dict(ARTICLE, published='2020-01-01 00:00:00')
+        self.store.skip_before(job['id'], old)
+        self.store.fail(job['id'], LONG, '旧文章暂时不可读')
+        self.assertEqual(self.store.snapshot()['jobs'][0]['failed'], 0)
+        second = dict(ARTICLE, idx=2, url='https://mp.weixin.qq.com/s/sibling')
+        self.store.save(job['id'], second)
+        self.assertEqual(self.store.check_known(job['id'], LONG), {'published': None})
+        self.store.fail(job['id'], LONG, '尚未取得缺失正文')
+        second_link = LONG.replace('idx=1', 'idx=2')
+        self.store.fail(job['id'], second_link, '迟到的重复失败')
+        finished = self.store.finish(job['id'], 'done')
+        self.assertEqual((finished['status'], finished['saved'], finished['failed']), ('partial', 1, 1))
+        self.assertEqual(self.store.finish(job['id'], 'done'), finished)
+        retry = self.start('incremental')
+        self.assertEqual(retry['since'], job['since'])
+        self.store.skip_before(retry['id'], old)
+        self.store.skip_known(retry['id'], second_link)
+        self.store.fail(retry['id'], second_link, '已归档文章的重复失败')
+        done = self.store.finish(retry['id'], 'done')
+        self.assertEqual((done['status'], done['saved'], done['skipped'], done['failed']), ('done', 1, 1, 0))
 
     def test_cutoff_only_advances_after_a_completed_incremental_job(self):
         # After initial creation, parent Queue schedules on claim too; pin its next run in the future.
@@ -303,6 +379,6 @@ class PageTest(unittest.TestCase):
         long = 'https://mp.weixin.qq.com/s?__biz=Qm9va3M%3D&mid=123&idx=2&sn=' + 'ab'*16
         self.assertEqual(public_url(long + '&from=tracking'), long)
         for invalid in ['https://mp.weixin.qq.com.evil.com/s/one', 'https://mp.weixin.qq.com/mp/profile',
-                        'https://mp.weixin.qq.com/s?__biz=Qm9va3M%3D&mid=123&idx=2']:
+                        'https://mp.weixin.qq.com/s?__biz=Qm9va3M%3D&mid=123&idx=2', long+'&idx=']:
             with self.assertRaises(ValueError):
                 public_url(invalid)

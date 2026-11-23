@@ -201,14 +201,14 @@ def run_public_job(api, job, discover, read_article):
     def collect(url):
         nonlocal saved_or_checked, failures, invalid_links
         try:
-            published = api('public_skip_known', id=job_id, url=url)['published']
+            known = api('public_skip_known', id=job_id, url=url)
         except RequestRejected:
             failures += 1
             invalid_links += 1
             return False
-        if published:
+        if known['published'] or known.get('before_cutoff'):
             saved_or_checked += 1
-            return bool(cutoff and published < cutoff)
+            return bool(known.get('before_cutoff') or (cutoff and known['published'] < cutoff))
         try:
             article = read_article(url)
             if article['biz'] != job['account']['biz']:
@@ -241,7 +241,9 @@ def run_public_job(api, job, discover, read_article):
                            should_stop=stopped, max_pages=job.get('max_pages'), **resume)
         if outcome.get('yielded') or stopped():
             return
-        status = 'done' if outcome['complete'] and not failures else 'partial'
+        # The queue counts outstanding item failures when finishing. A later
+        # verified alias may have resolved a read error from this traversal.
+        status = 'done' if outcome['complete'] and not invalid_links else 'partial'
         message = outcome.get('reason', '')
         if invalid_links:
             message += f'。{invalid_links} 个文章链接未通过校验。'

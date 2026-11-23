@@ -90,7 +90,7 @@ def worker_call(store, op, data, video_queue):
     if op == 'active':
         return dict(active=store.is_running(job_id))
     if op == 'skip_known':
-        return dict(published=store.skip_known(job_id, data['url']))
+        return store.check_known(job_id, data['url'])
     if op == 'save':
         return dict(status=store.save(job_id, data['article']))
     if op == 'skip_before':

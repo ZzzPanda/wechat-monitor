@@ -51,19 +51,25 @@ def digest(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 
-def verified_url(url):
+def article_key(biz, mid, idx):
+    return digest(f'{biz}:{mid}:{idx}')
+
+
+def url_identity(url):
+    """Validate a public URL and return the article identity exposed by a long link."""
     if not isinstance(url, str) or len(url) > 4096:
         raise ValueError('无效的微信文章地址。')
     parts = urlsplit(url)
     if parts.scheme == 'https' and parts.netloc == 'mp.weixin.qq.com' and not parts.fragment:
         if re.fullmatch(r'/s/[A-Za-z0-9_-]{1,128}', parts.path) and not parts.query:
-            return url
+            return None
         if parts.path == '/s':
             q = parse_qs(parts.query, keep_blank_values=True)
             if (set(q) == {'__biz', 'mid', 'idx', 'sn'} and all(len(v) == 1 for v in q.values())
                     and BIZ.fullmatch(q['__biz'][0]) and NUMBER.fullmatch(q['mid'][0])
-                    and NUMBER.fullmatch(q['idx'][0]) and re.fullmatch('[a-fA-F0-9]{32}', q['sn'][0])):
-                return url
+                    and NUMBER.fullmatch(q['idx'][0]) and int(q['idx'][0]) <= 2**31-1
+                    and re.fullmatch('[a-fA-F0-9]{32}', q['sn'][0])):
+                return q['__biz'][0], q['mid'][0], int(q['idx'][0])
     raise ValueError('需要公开的微信文章链接。')
 
 
@@ -76,11 +82,9 @@ def validate_article(item):
             not valid_text(item['author'], 128) or not valid_text(item['title'], 1024)
             or not item['body'].strip() or len(item['body']) > 2_000_000):
         raise ValueError('文章身份、标题或正文无效。')
-    verified_url(item['url'])
-    if urlsplit(item['url']).path == '/s':
-        q = parse_qs(urlsplit(item['url']).query)
-        if (q['__biz'][0], q['mid'][0], int(q['idx'][0])) != (item['biz'], item['mid'], item['idx']):
-            raise ValueError('文章链接与正文中的公众号或图文序号不一致。')
+    identity = url_identity(item['url'])
+    if identity and identity != (item['biz'], item['mid'], item['idx']):
+        raise ValueError('文章链接与正文中的公众号或图文序号不一致。')
     stamp = datetime.strptime(item['published'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=BEIJING)
     if stamp.strftime('%Y-%m-%d %H:%M:%S') != item['published']:
         raise ValueError('文章发布时间格式无效。')
@@ -242,6 +246,21 @@ class PublicArticles(Queue):
                 saved = db.execute('SELECT cursor FROM history_checkpoints WHERE job_id=?', (job['id'],)).fetchone()
                 job['checkpoint'] = json.loads(saved['cursor']) if saved else None
             account = dict(db.execute('SELECT * FROM accounts WHERE id=?', (job['profile_url'],)).fetchone())
+            if job['failed']:
+                # Jobs recovered from an older worker may still have failures
+                # keyed by the raw URL. Only rekey this job's valid long links.
+                legacy = db.execute("""SELECT url,error FROM items WHERE job_id=? AND status='failed'
+                    AND work_key LIKE 'url:%' AND url LIKE 'https://mp.weixin.qq.com/s?%'""",
+                    (job['id'],)).fetchall()
+                for item in legacy:
+                    try:
+                        identity = url_identity(item['url'])
+                    except ValueError:
+                        continue
+                    if identity and identity[0] == account['biz']:
+                        self._record_failure(db, job['id'], account['id'], item['url'], identity, item['error'])
+                if legacy:
+                    job.update(job_row(db, job['id']))
             db.execute('INSERT OR IGNORE INTO job_options(job_id) VALUES(?)', (job['id'],))
             last = db.execute("""SELECT max(o.started_at) FROM jobs j JOIN job_options o ON o.job_id=j.id
                                WHERE j.profile_url=? AND j.mode='incremental' AND j.status='done'""",
@@ -293,40 +312,79 @@ class PublicArticles(Queue):
         return job
 
     @staticmethod
-    def _mark(db, job_id, key, url, status, error=''):
+    def _mark(db, job_id, key, url, status, error='', *, reopen_skip=False):
         # A failed read initially has only a URL; resolve it to the stable article key after retry.
         unresolved = 'url:' + digest(url)
         if key != unresolved:
             db.execute("DELETE FROM items WHERE job_id=? AND work_key=? AND status='failed'", (job_id, unresolved))
         db.execute('''INSERT INTO items(job_id,work_key,url,status,error) VALUES(?,?,?,?,?)
-                      ON CONFLICT(job_id,work_key) DO UPDATE SET status=excluded.status,error=excluded.error
-                      WHERE items.status NOT IN ('saved','skipped')''', (job_id, key, url, status, error))
+                      ON CONFLICT(job_id,work_key) DO UPDATE SET url=excluded.url,status=excluded.status,error=excluded.error
+                      WHERE items.status NOT IN ('saved','skipped')
+                         OR (items.status='skipped' AND (excluded.status='saved' OR ?))''',
+                   (job_id, key, url, status, error, reopen_skip))
         db.execute('UPDATE jobs SET updated_at=? WHERE id=?', (int(time.time()), job_id))
 
     def fail(self, job_id, url, error):
-        url = verified_url(url)
+        identity = url_identity(url)
         with self.db(write=True) as db:
-            self._job(db, job_id)
-            self._mark(db, job_id, 'url:' + digest(url), url, 'failed', str(error)[:500])
+            job = self._job(db, job_id)
+            if identity and identity[0] != job['biz']:
+                raise ValueError('文章链接中的公众号与所选账号不一致。')
+            self._record_failure(db, job_id, job['account_id'], url, identity, str(error)[:500])
+
+    def _record_failure(self, db, job_id, account_id, url, identity, error):
+        existing = self._by_url(db, account_id, url, identity)
+        if existing:
+            self._mark(db, job_id, existing['id'], url, 'skipped')
+            return
+        key = article_key(*identity) if identity else 'url:' + digest(url)
+        # A skipped, unarchived article becomes a required backfill once a sibling is saved.
+        sibling = identity and db.execute('SELECT 1 FROM articles WHERE biz=? AND mid=? LIMIT 1',
+                                          identity[:2]).fetchone()
+        self._mark(db, job_id, key, url, 'failed', error, reopen_skip=bool(sibling))
 
     @staticmethod
-    def _by_url(db, account_id, url):
+    def _by_url(db, account_id, url, identity):
+        if identity:
+            return db.execute('SELECT id,published FROM articles WHERE account_id=? AND biz=? AND mid=? AND idx=?',
+                              (account_id, *identity)).fetchone()
         return db.execute('''SELECT a.id,a.published FROM article_urls u JOIN articles a ON u.article_id=a.id
                             WHERE u.url=? AND a.account_id=?''', (url, account_id)).fetchone()
 
     def known_url(self, account_id, url):
+        try:
+            identity = url_identity(url)
+        except ValueError:
+            return False
         with self.db() as db:
-            return self._by_url(db, account_id, url) is not None
+            return self._by_url(db, account_id, url, identity) is not None
 
-    def skip_known(self, job_id, url):
-        url = verified_url(url)
+    def check_known(self, job_id, url):
+        identity = url_identity(url)
         with self.db(write=True) as db:
             job = self._job(db, job_id)
-            existing = self._by_url(db, job['account_id'], url)
+            if identity and identity[0] != job['biz']:
+                raise ValueError('文章链接中的公众号与所选账号不一致。')
+            existing = self._by_url(db, job['account_id'], url, identity)
             if existing:
                 self._mark(db, job_id, existing['id'], url, 'skipped')
-                return existing['published']
-            return None
+                return dict(published=existing['published'])
+            if identity and job['mode'] == 'incremental':
+                # Without an archived sibling, a successful incremental skip can only
+                # come from an article verified to predate that job's cutoff.
+                key = article_key(*identity)
+                older = db.execute("""SELECT 1 FROM jobs j JOIN job_options o ON o.job_id=j.id
+                    JOIN items i ON i.job_id=j.id AND i.work_key=? AND i.status='skipped'
+                    WHERE j.profile_url=? AND j.mode='incremental' AND o.since<=?
+                    AND NOT EXISTS (SELECT 1 FROM articles WHERE biz=? AND mid=?) LIMIT 1""",
+                    (key, job['account_id'], job['since'], *identity[:2])).fetchone()
+                if older:
+                    self._mark(db, job_id, key, url, 'skipped')
+                    return dict(published=None, before_cutoff=True)
+            return dict(published=None)
+
+    def skip_known(self, job_id, url):
+        return self.check_known(job_id, url)['published']
 
     def save(self, job_id, article):
         return self._store(job_id, article, before=False)
@@ -365,11 +423,16 @@ class PublicArticles(Queue):
 
     def _store(self, job_id, a, before):
         published_at = validate_article(a)
-        key = digest(f"{a['biz']}:{a['mid']}:{a['idx']}")
         with self.db(write=True) as db:
             job = self._job(db, job_id)
             if job['biz'] != a['biz']:
                 raise ValueError('该文章的公众号标识与所选公众号不一致。')
+            identity = (a['biz'], a['mid'], a['idx'])
+            existing = self._by_url(db, job['account_id'], a['url'], identity)
+            key = existing['id'] if existing else article_key(*identity)
+            alias = db.execute('SELECT article_id FROM article_urls WHERE url=?', (a['url'],)).fetchone()
+            if alias is not None and alias[0] != key:
+                raise ValueError('已收录的文章链接指向不同的图文，请核实。')
             if before:
                 if job['mode'] != 'incremental' or job['since'] is None or published_at >= job['since']:
                     raise ValueError('该文章未早于本次增量采集的起点。')
@@ -378,9 +441,6 @@ class PublicArticles(Queue):
                 if not known_push:
                     self._mark(db, job_id, key, a['url'], 'skipped')
                     return 'skipped'
-            alias = db.execute('SELECT article_id FROM article_urls WHERE url=?', (a['url'],)).fetchone()
-            if alias is not None and alias[0] != key:
-                raise ValueError('已收录的文章链接指向不同的图文，请核实。')
             inserted = db.execute('''INSERT INTO articles(id,account_id,biz,mid,idx,author,url,title,published,body)
                 VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(biz,mid,idx) DO NOTHING''',
                 (key, job['account_id'], a['biz'], a['mid'], a['idx'], a['author'], a['url'],

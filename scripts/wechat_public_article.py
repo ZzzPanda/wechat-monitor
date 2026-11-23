@@ -43,7 +43,7 @@ def public_url(value):
         base = 'https://mp.weixin.qq.com'
         if re.fullmatch(r'/s/[\w-]{1,128}', u.path, re.ASCII):
             return base + u.path
-        q = parse_qs(u.query)
+        q = parse_qs(u.query, keep_blank_values=True)
         rules = [('__biz', BIZ), ('mid', NUMBER), ('idx', NUMBER), ('sn', r'[A-Fa-f0-9]{32}')]
         if u.path == '/s' and all(len(q.get(k, [])) == 1 and re.fullmatch(pattern, q[k][0]) for k, pattern in rules):
             return base + '/s?' + urlencode([(k, q[k][0]) for k, _ in rules])

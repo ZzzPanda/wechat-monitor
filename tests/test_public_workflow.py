@@ -88,6 +88,42 @@ class PublicWorkflow(unittest.TestCase):
         self.api('DELETE',path,{'version':note['version']},expected=409)
         self.assertTrue(self.api('DELETE',path,{'version':restored['account']['version']})['removed'])
 
+    def test_recovered_alias_counts_as_one_success_and_unresolved_links_still_fail(self):
+        choice = self.api('GET', '/api/public/search?q=Test')['results'][0]
+        account = self.api('POST', '/api/public/accounts', {'token':choice['token']})['account']
+        urls = [f'https://mp.weixin.qq.com/s?__biz={self.biz}&mid=123&idx=1&sn='+'ab'*16,
+                'https://mp.weixin.qq.com/s/working']
+        requests = []
+        def read(url):
+            requests.append(url)
+            if url != urls[1]:
+                raise ValueError('页面需要验证')
+            return dict(url=url, biz=self.biz, mid='123', idx=1, author='Test', title='标题',
+                        body='已核实正文', published='2026-11-20 21:00:00')
+        def grid(entry, *, on_article, **options):
+            for url in urls:
+                on_article(url)
+            return dict(complete=True, reason='到底')
+        def run():
+            self.server.public_articles.enqueue(account['id'])
+            job = self.worker('claim')['job']
+            crawl_worker.run_public_job(self.worker, job, grid, read)
+            return next(j for j in self.api('GET', '/api/public')['jobs'] if j['id']==job['id'])
+
+        first = run()
+        self.assertEqual(requests, urls)
+        self.assertEqual((first['status'], first['discovered'], first['saved'], first['failed']), ('done',1,1,0))
+        requests.clear()
+        urls.append(urls[0].replace('idx=1', 'idx=2'))
+        second = run()
+        self.assertEqual(requests, [urls[2]])
+        self.assertEqual((second['status'], second['discovered'], second['skipped'], second['failed']),
+                         ('partial',2,1,1))
+        urls[:] = [urls[0]+'&idx=']
+        rejected = run()
+        self.assertEqual((rejected['status'], rejected['discovered']), ('partial',0))
+        self.assertIn('未通过校验', rejected['error'])
+
     def test_archive_then_scheduled_new_sibling(self):
         choice = self.api('GET', '/api/public/search?q=Test')['results'][0]
         self.api('POST', '/api/public/accounts', {'token': 'unverified'}, expected=400)
